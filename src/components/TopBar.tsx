@@ -39,6 +39,8 @@ interface TopBarProps {
   onCycleWeather: () => void;
   onOpenValidation: () => void;
   onOpenReport: () => void;
+  /** Operating-mode selector (Simulation / Real Camera / Hybrid). */
+  modeControl?: React.ReactNode;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -61,6 +63,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onCycleWeather,
   onOpenValidation,
   onOpenReport,
+  modeControl,
 }) => {
   const weatherLabel =
     weatherMode === 'clear'
@@ -93,6 +96,16 @@ export const TopBar: React.FC<TopBarProps> = ({
           </p>
         </div>
       </div>
+
+      {/* Operating mode: Simulation / Real Camera / Hybrid */}
+      {modeControl && (
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[9px] font-mono-tech uppercase tracking-wider text-slate-500 hidden 2xl:inline">
+            Mode
+          </span>
+          {modeControl}
+        </div>
+      )}
 
       {/* Center: 5 Scenario Selector Pills */}
       <nav className="flex items-center gap-1 bg-[#0B0F17] p-1 rounded-lg border border-slate-400/15 shrink-0">
