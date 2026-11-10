@@ -80,6 +80,9 @@ export const CameraPanel: React.FC<Props> = ({
   // silently stalled-looking panel of zeros.
   const slowBackend = !!stats && stats.framesInferred > 0 && stats.avgInferenceMs > 1500;
 
+  const selectedDevice = state.devices.find((d) => d.deviceId === state.selectedDeviceId) ?? null;
+  const selectedIsUsbLike = selectedDevice?.kind === 'usb_uvc';
+
   const classCounts = new Map<string, number>();
   for (const d of frame?.detections ?? []) {
     classCounts.set(d.classId, (classCounts.get(d.classId) ?? 0) + 1);
@@ -124,6 +127,29 @@ export const CameraPanel: React.FC<Props> = ({
           </button>
         </div>
 
+        {/* Resolution selector */}
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <select
+            value={state.resolution ? `${state.resolution.width}x${state.resolution.height}` : ''}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return actions.setResolution(null);
+              const [w, h] = v.split('x').map(Number);
+              actions.setResolution({ width: w, height: h });
+            }}
+            className="flex-1 min-w-0 bg-[#0B0F17] border border-slate-400/20 rounded-lg px-2 py-1 text-[10.5px] font-mono-tech text-slate-200 outline-none focus:border-cyan-400/50"
+            title="Capture resolution. Modes are read from the device where the browser exposes them."
+          >
+            <option value="">Resolution: device default</option>
+            {state.resolutionOptions.map((r) => (
+              <option key={`${r.width}x${r.height}`} value={`${r.width}x${r.height}`}>
+                {r.label}
+                {r.reported ? '' : ' (unverified)'}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="flex items-center justify-between text-[9px] font-mono-tech text-slate-500 mb-2">
           <span className="flex items-center gap-1">
             <Usb className="w-3 h-3" />
@@ -138,7 +164,17 @@ export const CameraPanel: React.FC<Props> = ({
         <div className="grid grid-cols-2 gap-1.5">
           <button
             onClick={() => void actions.connectLocal()}
-            disabled={state.cameraStatus === 'connecting' || state.cameraStatus === 'requesting_permission'}
+            /*
+             * Only block while a *local* capture is starting. A WebRTC session
+             * waiting for a phone can sit in `connecting` for up to its join
+             * timeout (120 s), which used to lock the USB camera out entirely —
+             * the operator could not switch to a webcam that was already
+             * plugged in.
+             */
+            disabled={
+              state.sourceKind !== 'mobile_webrtc' &&
+              (state.cameraStatus === 'connecting' || state.cameraStatus === 'requesting_permission')
+            }
             className="px-2 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 disabled:opacity-40 disabled:cursor-not-allowed border border-cyan-400/40 text-cyan-200 text-[10.5px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
           >
             <Plug className="w-3.5 h-3.5" />
@@ -146,13 +182,24 @@ export const CameraPanel: React.FC<Props> = ({
           </button>
           <button
             onClick={actions.disconnect}
-            disabled={state.cameraStatus === 'idle' || state.cameraStatus === 'stopped'}
+            disabled={
+              (state.cameraStatus === 'idle' || state.cameraStatus === 'stopped') &&
+              state.sourceKind !== 'mobile_webrtc'
+            }
             className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-400/25 text-slate-200 text-[10.5px] font-medium flex items-center justify-center gap-1.5 cursor-pointer"
           >
             <CameraOff className="w-3.5 h-3.5" />
             Disconnect
           </button>
         </div>
+
+        {selectedIsUsbLike && (
+          <p className="mt-1.5 text-[9px] leading-snug text-slate-500">
+            Labelled USB/UVC from its device name — the browser does not expose the physical bus, so this
+            is an inference. A phone only appears here if the OS presents it as a capture device;
+            otherwise use QR pairing.
+          </p>
+        )}
 
         {state.error && (
           <div className="mt-2 rounded-lg border border-rose-500/40 bg-rose-500/10 p-2">

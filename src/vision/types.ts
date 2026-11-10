@@ -172,11 +172,33 @@ export interface CameraError {
   hint?: string;
 }
 
+export interface CameraCapability {
+  width: number;
+  height: number;
+  /** Best frame rate the device reports for this mode, 0 when unknown. */
+  maxFrameRate: number;
+}
+
 export interface CameraDeviceInfo {
   deviceId: string;
   label: string;
   kind: CameraSourceKind;
   groupId?: string;
+  /**
+   * Modes the device reports through `getCapabilities()`. Empty when the
+   * browser does not expose capabilities (Safari, some Firefox builds) — in
+   * that case the UI offers the common presets instead and the device decides.
+   */
+  capabilities?: CameraCapability[];
+}
+
+/** A selectable capture mode offered in the UI. */
+export interface CameraResolutionOption {
+  width: number;
+  height: number;
+  label: string;
+  /** False when the device explicitly does not report this mode. */
+  reported: boolean;
 }
 
 export interface DetectionConfig {

@@ -8,9 +8,25 @@
  * render loop keeps its frame budget.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CameraDeviceInfo, CameraError, CameraSourceKind, CameraStatus, DetectionConfig, DetectionFrame, ModelStatus, OperatingMode } from '../vision/types';
+import type {
+  CameraDeviceInfo,
+  CameraError,
+  CameraResolutionOption,
+  CameraSourceKind,
+  CameraStatus,
+  DetectionConfig,
+  DetectionFrame,
+  ModelStatus,
+  OperatingMode,
+} from '../vision/types';
 import { DetectionEngine, DEFAULT_DETECTION_CONFIG } from '../vision/detectionEngine';
-import { LocalCameraSource, cameraErrorFrom, listCameraDevices } from './deviceSource';
+import {
+  LocalCameraSource,
+  cameraErrorFrom,
+  listCameraDevices,
+  probeDeviceCapabilities,
+  resolutionOptionsFor,
+} from './deviceSource';
 import { WebRtcCameraSource } from './webrtcSource';
 import type { FrameSource } from './types';
 import {
@@ -92,6 +108,10 @@ export interface CameraSystemState {
   sourceKind: CameraSourceKind | null;
   config: DetectionConfig;
   calibration: CameraCalibration | null;
+  /** Chosen capture size, null = browser default. */
+  resolution: { width: number; height: number } | null;
+  /** Modes available for the selected device (device-reported when possible). */
+  resolutionOptions: CameraResolutionOption[];
 }
 
 export interface CameraSystemActions {
@@ -106,6 +126,7 @@ export interface CameraSystemActions {
   loadPotholeModel: (file: File) => Promise<ModelStatus>;
   startPairing: () => Promise<void>;
   cancelPairing: () => void;
+  setResolution: (next: { width: number; height: number } | null) => void;
   setConfig: (patch: Partial<DetectionConfig>) => void;
   setCalibration: (c: CameraCalibration | null) => void;
   dismissError: () => void;
@@ -206,6 +227,16 @@ export function useCameraSystem(
       setPermission(result.permission);
       setDevicesLoaded(true);
       if (!result.ok) return;
+      // Real hardware modes, read once per device. Only after permission, since
+      // getCapabilities() needs a track and the labels need consent.
+      if (result.permission === 'granted') {
+        const withCaps = await Promise.all(
+          result.devices.map(async (d) =>
+            d.capabilities?.length ? d : { ...d, capabilities: await probeDeviceCapabilities(d.deviceId) }
+          )
+        );
+        setDevices(withCaps);
+      }
     } else {
       setError(result.error);
       const fallback = (result as unknown as { devices?: CameraDeviceInfo[] }).devices ?? [];
@@ -214,8 +245,16 @@ export function useCameraSystem(
     }
   }, []);
 
+  /**
+   * Selected capture size. `null` = let the browser pick, which is the right
+   * default for a device whose real modes are unknown.
+   */
+  const [resolution, setResolutionState] = useState<{ width: number; height: number } | null>(null);
+
   const selectDevice = useCallback((deviceId: string | null) => {
     setSelectedDeviceId(deviceId);
+    // Modes differ per device; never carry a stale choice across devices.
+    setResolutionState(null);
   }, []);
 
   /**
@@ -254,21 +293,37 @@ export function useCameraSystem(
 
   const connectLocal = useCallback(async () => {
     // Release whatever was running before (single camera source at a time).
-    sourceRef.current?.stop();
-    engineRef.current?.setSource(null);
+    // Uses releaseSource so the previous source's late callbacks can no longer
+    // resurrect it — the same ownership rule the WebRTC path follows.
+    releaseSource();
     setFrame(null);
     setError(null);
     setStatusDetail('');
 
+    const chosen = devices.find((d) => d.deviceId === selectedDeviceId) ?? null;
     const source = new LocalCameraSource(
-      { deviceId: selectedDeviceId ?? undefined, width: 1280, height: 720, frameRate: 30 },
+      {
+        deviceId: selectedDeviceId ?? undefined,
+        kind: chosen?.kind,
+        label: chosen?.label,
+        // Only constrain when the user picked a mode; otherwise let the browser
+        // choose, which avoids OverconstrainedError on unknown hardware.
+        width: resolution?.width,
+        height: resolution?.height,
+        frameRate: 30,
+      },
       {
         status: (s, detail) => {
+          if (sourceRef.current !== source) return;
           setCameraStatus(s);
           if (detail) setStatusDetail(detail);
         },
-        error: (e) => setError(e),
+        error: (e) => {
+          if (sourceRef.current !== source) return;
+          setError(e);
+        },
         trackInfo: (info) => {
+          if (sourceRef.current !== source) return;
           setTrackInfo({ width: info.width, height: info.height, label: info.label, frameRate: info.frameRate });
           setSourceKind(info.sourceKind);
         },
@@ -289,7 +344,7 @@ export function useCameraSystem(
     } catch (err) {
       setError(cameraErrorFrom(err));
     }
-  }, [refreshDevices, selectedDeviceId]);
+  }, [refreshDevices, selectedDeviceId, devices, resolution, releaseSource]);
 
   // --- QR / WebRTC pairing ------------------------------------------------
   const pairingInFlight = useRef(false);
@@ -467,6 +522,10 @@ export function useCameraSystem(
     }
   }, [loadModel]);
 
+  const setResolution = useCallback((next: { width: number; height: number } | null) => {
+    setResolutionState(next);
+  }, []);
+
   const setConfig = useCallback((patch: Partial<DetectionConfig>) => {
     setConfigState((prev) => {
       const next = { ...prev, ...patch };
@@ -569,6 +628,8 @@ export function useCameraSystem(
       sourceKind,
       config,
       calibration,
+      resolution,
+      resolutionOptions: resolutionOptionsFor(devices.find((d) => d.deviceId === selectedDeviceId) ?? null),
     }),
     [
       mode,
@@ -588,6 +649,7 @@ export function useCameraSystem(
       sourceKind,
       config,
       calibration,
+      resolution,
     ]
   );
 
@@ -604,6 +666,7 @@ export function useCameraSystem(
       loadPotholeModel,
       startPairing,
       cancelPairing,
+      setResolution,
       setConfig,
       setCalibration,
       dismissError: () => setError(null),
@@ -620,6 +683,7 @@ export function useCameraSystem(
       loadPotholeModel,
       startPairing,
       cancelPairing,
+      setResolution,
       setConfig,
       setCalibration,
     ]

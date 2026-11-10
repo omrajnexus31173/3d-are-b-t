@@ -9,19 +9,33 @@
  * When it does not, `listCameraDevices()` explains that and the UI points the
  * user to the QR/WebRTC path.
  */
-import type { CameraDeviceInfo, CameraError, CameraSourceKind } from '../vision/types';
+import type {
+  CameraCapability,
+  CameraDeviceInfo,
+  CameraError,
+  CameraResolutionOption,
+  CameraSourceKind,
+} from '../vision/types';
 import type { CameraDeviceListResult, FrameSource, FrameSourceInfo } from './types';
 import { observeVideoReady } from './videoReady';
 
-/** Map a MediaDeviceInfo to a human-friendly label + inferred source kind. */
+/**
+ * Classify a video input from its label.
+ *
+ * The label is the only signal the browser gives us, so this is a *guess* and
+ * the UI must not present it as certain. In particular a phone attached by USB
+ * is only listed here when the OS/browser exposes it as a capture device
+ * (Android USB webcam mode, iPhone Continuity Camera); otherwise it does not
+ * appear at all.
+ */
 export function classifyVideoDevice(device: MediaDeviceInfo, index: number): CameraDeviceInfo {
   const raw = device.label || `Camera ${index + 1}`;
   const lower = raw.toLowerCase();
   let kind: CameraSourceKind = 'webcam';
-  if (/usb|uvc|web ?cam|hd camera|external|capture|elgato|logitech|brio|c920|c922/.test(lower)) {
+  if (/usb|uvc|hd camera|external|capture|elgato|logitech|brio|c920|c922|obsbot|razer kiyo/.test(lower)) {
     kind = 'usb_uvc';
   }
-  if (/iphone|android|pixel|galaxy|redmi|oneplus|phone|continuity/.test(lower)) {
+  if (/iphone|android|pixel|galaxy|redmi|oneplus|continuity/.test(lower)) {
     kind = 'usb_uvc';
   }
   return {
@@ -30,6 +44,90 @@ export function classifyVideoDevice(device: MediaDeviceInfo, index: number): Cam
     kind,
     groupId: device.groupId,
   };
+}
+
+/**
+ * Read the modes a device actually supports.
+ *
+ * `MediaStreamTrack.getCapabilities()` is the only browser API that reports
+ * real hardware modes; it is not available everywhere and is only populated
+ * once a track exists. We open the device briefly, read the caps, and close it
+ * immediately so the camera light does not stay on.
+ */
+export async function probeDeviceCapabilities(deviceId: string): Promise<CameraCapability[]> {
+  if (!navigator.mediaDevices?.getUserMedia) return [];
+  let stream: MediaStream | null = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { deviceId: { exact: deviceId } },
+    });
+    const track = stream.getVideoTracks()[0];
+    const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & {
+      width?: { min: number; max: number };
+      height?: { min: number; max: number };
+      frameRate?: { min: number; max: number };
+    };
+    if (!caps.width || !caps.height) return [];
+    const maxW = caps.width.max;
+    const maxH = caps.height.max;
+    const maxFps = caps.frameRate?.max ?? 0;
+    // Report the aspect-correct ladder the device can actually reach. Only modes
+    // fully inside the reported range are listed; nothing is invented.
+    const aspect = maxW / maxH;
+    const candidates = [
+      [320, 240],
+      [640, 360],
+      [640, 480],
+      [800, 600],
+      [1280, 720],
+      [1920, 1080],
+      [2560, 1440],
+      [3840, 2160],
+    ] as const;
+    const out: CameraCapability[] = [];
+    for (const [w, h] of candidates) {
+      if (w <= maxW && h <= maxH) {
+        // Keep modes whose aspect ratio rounds to the device's own aspect.
+        if (Math.abs(w / h - aspect) < 0.02 || Math.abs(w / h - 4 / 3) < 0.02 || Math.abs(w / h - 16 / 9) < 0.02) {
+          out.push({ width: w, height: h, maxFrameRate: maxFps });
+        }
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    stream?.getTracks().forEach((t) => t.stop());
+  }
+}
+
+/**
+ * Build the resolution menu for a device.
+ *
+ * When the browser reports real capabilities we list exactly those modes and
+ * mark them `reported: true`. When it does not (Safari, some Firefox builds) we
+ * fall back to common presets and mark them `reported: false` so the UI can say
+ * the device may not honour them — the browser is free to return something else
+ * and we read the real size back from the video track afterwards.
+ */
+export function resolutionOptionsFor(device: CameraDeviceInfo | null): CameraResolutionOption[] {
+  const reported = device?.capabilities ?? [];
+  if (reported.length > 0) {
+    return reported
+      .map((c) => ({
+        width: c.width,
+        height: c.height,
+        label: `${c.width}×${c.height}${c.maxFrameRate ? ` · ${Math.round(c.maxFrameRate)}fps` : ''}`,
+        reported: true,
+      }))
+      .sort((a, b) => b.width * b.height - a.width * a.height);
+  }
+  return [
+    { width: 1920, height: 1080, label: '1920×1080', reported: false },
+    { width: 1280, height: 720, label: '1280×720', reported: false },
+    { width: 640, height: 480, label: '640×480', reported: false },
+  ];
 }
 
 export function cameraErrorFrom(err: unknown): CameraError {
@@ -128,6 +226,10 @@ async function safeEnumerate(): Promise<CameraDeviceInfo[]> {
 
 export interface LocalCameraOptions {
   deviceId?: string;
+  /** Source kind from device classification (usb_uvc / webcam). */
+  kind?: CameraSourceKind;
+  /** Human label for the status line. */
+  label?: string;
   /** Preferred capture size; the browser may pick a closer supported mode. */
   width?: number;
   height?: number;
@@ -161,7 +263,10 @@ export class LocalCameraSource implements FrameSource {
     this.listeners = listeners;
     this.id = options.deviceId ? `local:${options.deviceId}` : 'local:default';
     this.label = 'Local camera';
-    this.kind = 'webcam';
+    // The classification is filled in by the caller once the device list is
+    // known; a bare `webcam` default would mislabel every USB camera.
+    this.kind = options.kind ?? 'webcam';
+    if (options.label) this.label = options.label;
   }
 
   describe(): string {
