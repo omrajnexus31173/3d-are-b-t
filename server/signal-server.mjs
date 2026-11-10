@@ -100,16 +100,38 @@ function randomToken(bytes = 32) {
   return randomBytes(bytes).toString('base64url');
 }
 
+/**
+ * Usable addresses for a phone on the same network.
+ *
+ * Link-local APIPA addresses (169.254.0.0/16) are excluded: they appear when a
+ * container/NIC has no DHCP lease and are never reachable from a phone, yet
+ * they are exactly the address a naive "first non-internal IPv4" pick returns.
+ * Private ranges are ranked first, then any other routable address.
+ */
+function usableAddress(address) {
+  if (address.startsWith('169.254.')) return false;
+  if (address.startsWith('127.')) return false;
+  return true;
+}
+
+function addressRank(address) {
+  if (address.startsWith('192.168.')) return 0;
+  if (address.startsWith('10.')) return 1;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) return 2;
+  return 3;
+}
+
 function lanUrls() {
   const out = [];
   const ifaces = networkInterfaces();
   for (const [name, addrs] of Object.entries(ifaces)) {
     for (const addr of addrs ?? []) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        out.push({ name, address: addr.address });
-      }
+      if (addr.family !== 'IPv4' || addr.internal) continue;
+      if (!usableAddress(addr.address)) continue;
+      out.push({ name, address: addr.address });
     }
   }
+  out.sort((a, b) => addressRank(a.address) - addressRank(b.address));
   return out;
 }
 

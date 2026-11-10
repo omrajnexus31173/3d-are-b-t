@@ -184,7 +184,7 @@ export const QrPairingPanel: React.FC<Props> = ({ pairing, signalAvailable, onSt
           className="px-2 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/45 text-emerald-200 text-[10px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
         >
           <Smartphone className="w-3 h-3" />
-          Connect
+          Connect to phone
         </button>
       </div>
 

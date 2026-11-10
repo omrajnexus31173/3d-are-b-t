@@ -27,9 +27,22 @@ export interface WebRtcSourceOptions {
   onError: (error: CameraError) => void;
   onTrackInfo: (info: FrameSourceInfo) => void;
   onPeerState?: (state: 'waiting' | 'connecting' | 'connected' | 'disconnected') => void;
+  /** Fires whenever this source gains its remote video element. */
+  onVideoChange?: (video: HTMLVideoElement | null) => void;
 }
 
-const CONNECT_TIMEOUT_MS = 25_000;
+/**
+ * Two distinct waits, because they fail for different reasons:
+ *  - JOIN: the phone has not opened the QR link at all (scan/permission issue).
+ *  - MEDIA: the phone joined and negotiated, but no frames arrived (it is still
+ *    sitting on its permission prompt, or media is blocked).
+ *
+ * A single 25 s timer used to cover both, so a user who scanned, read the
+ * consent dialog and pressed "Start camera" after 25 s had their session torn
+ * down mid-negotiation ("peer_left" on the phone).
+ */
+const JOIN_TIMEOUT_MS = 120_000;
+const MEDIA_TIMEOUT_MS = 60_000;
 
 export class WebRtcCameraSource implements FrameSource {
   readonly kind: CameraSourceKind = 'mobile_webrtc';
@@ -77,8 +90,10 @@ export class WebRtcCameraSource implements FrameSource {
       const settleOk = () => {
         if (settled) return;
         settled = true;
+        this.settleStart = null;
         resolve();
       };
+      this.settleStart = settleOk;
       const settleErr = (err: CameraError) => {
         if (settled) return;
         settled = true;
@@ -119,14 +134,45 @@ export class WebRtcCameraSource implements FrameSource {
 
       this.socket.connect();
 
-      this.timeoutHandle = window.setTimeout(() => {
-        settleErr({
-          code: 'peer_failed',
-          message: 'The phone did not connect in time.',
-          hint: 'Make sure the phone opened the QR link, allowed the camera, and stays on this network.',
-        });
-      }, CONNECT_TIMEOUT_MS);
+      this.armTimeout(
+        JOIN_TIMEOUT_MS,
+        'The phone did not join in time.',
+        'Open the QR link on the phone. Generate a fresh QR code if this one expired.',
+        settleErr
+      );
     });
+  }
+
+  /**
+   * Stop and detach the remote stream without closing the signalling session or
+   * the peer connection, so a reconnecting phone can resume. This is what stops
+   * the detector from scoring the last frozen frame forever.
+   */
+  private releaseStream(): void {
+    this.settleStart = null;
+    this.opts.onVideoChange?.(null);
+    if (this.stream) {
+      for (const track of this.stream.getTracks()) track.stop();
+      this.stream = null;
+    }
+    if (this.video) {
+      this.video.srcObject = null;
+      this.video.remove();
+      this.video = null;
+    }
+  }
+
+  /** (Re)arm the one-shot connection timeout. */
+  private armTimeout(
+    ms: number,
+    message: string,
+    hint: string,
+    settleErr: (e: CameraError) => void
+  ) {
+    if (this.timeoutHandle !== null) window.clearTimeout(this.timeoutHandle);
+    this.timeoutHandle = window.setTimeout(() => {
+      settleErr({ code: 'peer_failed', message, hint });
+    }, ms);
   }
 
   private createPeerConnection() {
@@ -135,6 +181,8 @@ export class WebRtcCameraSource implements FrameSource {
       iceCandidatePoolSize: 2,
     });
     this.pc = pc;
+    this.localOfferSent = false;
+    this.offering = false;
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -150,7 +198,43 @@ export class WebRtcCameraSource implements FrameSource {
         track.stop();
         incoming.removeTrack(track);
       }
+      /*
+       * One element per source. A renegotiation can fire `ontrack` again for
+       * the same stream (and a re-offer after a camera flip does exactly that);
+       * creating a second hidden <video> there left the first attached to the
+       * page forever, still holding a live MediaStream. Reuse the element when
+       * it already carries this stream.
+       */
+      if (this.video && this.video.srcObject === incoming) {
+        this.stream = incoming;
+        if (this.timeoutHandle !== null) {
+          window.clearTimeout(this.timeoutHandle);
+          this.timeoutHandle = null;
+        }
+        this.setStatus('live', 'Phone camera streaming');
+        this.settleStart?.();
+        return;
+      }
+      if (this.video) {
+        const stale = this.video;
+        if (stale.srcObject) {
+          for (const t of (stale.srcObject as MediaStream).getTracks()) {
+            if (t !== incoming.getVideoTracks()[0]) t.stop();
+          }
+        }
+        stale.srcObject = null;
+        stale.remove();
+        this.video = null;
+      }
       this.stream = incoming;
+      // A remote track can end (phone closed the page / stopped the camera)
+      // without the peer connection closing immediately. Surface it right away.
+      for (const track of incoming.getVideoTracks()) {
+        track.addEventListener('ended', () => {
+          this.opts.onPeerState?.('disconnected');
+          this.setStatus('stopped', 'Phone stopped sending video');
+        });
+      }
       const video = document.createElement('video');
       video.playsInline = true;
       video.autoplay = true;
@@ -167,6 +251,10 @@ export class WebRtcCameraSource implements FrameSource {
           this.timeoutHandle = null;
         }
         this.setStatus('live', 'Phone camera streaming');
+        this.opts.onVideoChange?.(video);
+        // Media is here: this is what "connected" means, so settle start() now
+        // rather than waiting for a signalling message that may never come.
+        this.settleStart?.();
         this.opts.onPeerState?.('connected');
         this.opts.onTrackInfo({
           sourceId: this.id,
@@ -210,15 +298,44 @@ export class WebRtcCameraSource implements FrameSource {
     };
   }
 
+  private offering = false;
+  private localOfferSent = false;
+  /**
+   * Resolver for the in-flight `start()` promise.
+   *
+   * `start()` used to settle only from a signalling handler, i.e. only if
+   * another message arrived after the peer became live. When the media track
+   * was the last event — the normal case — the promise never settled, so
+   * `connectMobile()` never reached `engine.setSource(source)` and the detection
+   * engine had no source at all. The media path now settles it directly.
+   */
+  private settleStart: (() => void) | null = null;
+
+  /**
+   * Send the laptop's initial offer (recv-only: we never send our camera).
+   *
+   * `peer_joined` and `ready(peerPresent)` can both fire for the same phone, so
+   * this is idempotent: the recvonly transceiver is created once and no second
+   * offer is produced while an exchange is in flight or already answered.
+   * A duplicated transceiver would put two video m-lines in the SDP and the
+   * phone's single track would bind to only one of them.
+   */
   private async sendOffer() {
-    if (!this.pc) return;
+    const pc = this.pc;
+    if (!pc || this.offering || this.localOfferSent) return;
+    if (pc.signalingState !== 'stable') return;
+    this.offering = true;
     try {
-      const pc = this.pc;
-      // Receive-only transceiver: we never send our own camera to the phone.
-      pc.addTransceiver('video', { direction: 'recvonly' });
+      if (!pc.getTransceivers().some((t) => t.receiver?.track?.kind === 'video' || t.sender === null)) {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+      }
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      this.socket?.send({ type: 'offer', sdp: offer.sdp ?? '' } as unknown as SignalMessage);
+      this.localOfferSent = true;
+      this.socket?.send({
+        type: 'offer',
+        sdp: pc.localDescription?.sdp ?? offer.sdp ?? '',
+      } as unknown as SignalMessage);
       this.setStatus('connecting', 'Offer sent — waiting for the phone');
     } catch (err) {
       this.opts.onError({
@@ -226,6 +343,8 @@ export class WebRtcCameraSource implements FrameSource {
         message: `Failed to create WebRTC offer: ${err instanceof Error ? err.message : String(err)}`,
       });
       this.setStatus('error', 'offer failed');
+    } finally {
+      this.offering = false;
     }
   }
 
@@ -244,11 +363,20 @@ export class WebRtcCameraSource implements FrameSource {
         break;
       case 'peer_joined':
         this.setStatus('connecting', 'Phone joined — negotiating');
+        // The phone is here. What we are waiting for now is media, which the
+        // phone cannot send until its user grants camera permission.
+        this.armTimeout(
+          MEDIA_TIMEOUT_MS,
+          'The phone joined but sent no video.',
+          'Press "Start camera" on the phone and allow camera access.',
+          settleErr
+        );
         void this.sendOffer();
         break;
       case 'peer_left':
         this.setStatus('stopped', 'Phone disconnected');
         this.opts.onPeerState?.('disconnected');
+        this.releaseStream();
         break;
       case 'answer':
         try {
@@ -261,6 +389,32 @@ export class WebRtcCameraSource implements FrameSource {
           settleErr({
             code: 'peer_failed',
             message: `Invalid answer from phone: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+        break;
+      case 'offer':
+        /*
+         * The phone re-offers when it adds its camera track after the first
+         * negotiation (it must answer before the user has granted permission,
+         * so the initial m-line carries no track). Without this answer the
+         * video never flows.
+         */
+        try {
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+          this.remoteDescriptionSet = true;
+          for (const candidate of this.pendingCandidates.splice(0)) {
+            await pc.addIceCandidate(candidate).catch(() => undefined);
+          }
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          this.socket?.send({
+            type: 'answer',
+            sdp: pc.localDescription?.sdp ?? answer.sdp ?? '',
+          } as unknown as SignalMessage);
+        } catch (err) {
+          settleErr({
+            code: 'peer_failed',
+            message: `Failed to answer the phone's re-offer: ${err instanceof Error ? err.message : String(err)}`,
           });
         }
         break;

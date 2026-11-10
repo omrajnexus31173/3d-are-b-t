@@ -23,6 +23,47 @@ import {
 import type { CameraCalibration } from '../vision/distance';
 import { POTHOLE_MODEL } from '../vision/models';
 
+/**
+ * Pick the host a *phone* should use to open this app.
+ *
+ * A QR code that embeds `localhost` (or `127.0.0.1`) is unscannable in
+ * practice: on the phone that address means the phone itself. When the laptop
+ * is already on a LAN address we keep it; otherwise we fall back to the
+ * signalling server's own LAN candidates and finally to the window host.
+ */
+function usableLanAddress(address: string): boolean {
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(address)) return false;
+  if (address.startsWith('169.254.')) return false; // link-local / APIPA — never routable from a phone
+  if (address.startsWith('127.')) return false;
+  return true;
+}
+
+function lanHostOf(hostname: string): boolean {
+  return /^(localhost|127\.|0\.0\.0\.0|\[::1\])/.test(hostname);
+}
+
+function buildPhoneUrl(session: CreateSessionResult): URL {
+  const url = new URL(window.location.href);
+  url.hash = '';
+  if (lanHostOf(url.hostname)) {
+    const candidate = session.lanAddresses?.find((a) => usableLanAddress(a.address));
+    if (candidate) url.hostname = candidate.address;
+  }
+  return url;
+}
+
+function phoneSignalBase(session: CreateSessionResult, protocol: string): string {
+  const base = new URL(signalBaseUrl());
+  if (lanHostOf(base.hostname)) {
+    const candidate = session.lanAddresses?.find((a) => usableLanAddress(a.address));
+    if (candidate) {
+      base.hostname = candidate.address;
+      base.protocol = protocol;
+    }
+  }
+  return base.toString().replace(/\/$/, '');
+}
+
 export interface PairingState {
   status: 'idle' | 'creating' | 'waiting' | 'connected' | 'error' | 'expired';
   session: CreateSessionResult | null;
@@ -177,26 +218,39 @@ export function useCameraSystem(
     setSelectedDeviceId(deviceId);
   }, []);
 
+  /**
+   * Stop and detach the active source, and clear its remote video element.
+   * Stops tracks so the phone's camera indicator turns off and no stale
+   * MediaStream is left attached to a hidden element.
+   */
+  const releaseSource = useCallback(() => {
+    const current = sourceRef.current;
+    sourceRef.current = null;
+    try {
+      current?.stop();
+    } catch {
+      /* already gone */
+    }
+    if (engineRef.current) engineRef.current.setSource(null);
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setSourceKind(null);
+  }, []);
+
   const disconnect = useCallback(() => {
     engineRef.current?.stop();
     setDetecting(false);
-    sourceRef.current?.stop();
-    sourceRef.current = null;
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    releaseSource();
     setCameraStatus('stopped');
     setStatusDetail('');
     setTrackInfo(null);
     setFrame(null);
-    setSourceKind(null);
     setPairing(initialPairing);
     const session = pairingSessionRef.current;
     if (session) {
       void closeCameraSession(session.sessionId, session.sessionToken);
       pairingSessionRef.current = null;
     }
-  }, []);
+  }, [releaseSource]);
 
   const connectLocal = useCallback(async () => {
     // Release whatever was running before (single camera source at a time).
@@ -238,7 +292,13 @@ export function useCameraSystem(
   }, [refreshDevices, selectedDeviceId]);
 
   // --- QR / WebRTC pairing ------------------------------------------------
+  const pairingInFlight = useRef(false);
+
   const startPairing = useCallback(async () => {
+    // Guard against a double submit (double click / StrictMode replay) creating
+    // two sessions and leaving a QR code that points at the abandoned one.
+    if (pairingInFlight.current) return;
+    pairingInFlight.current = true;
     setPairing({ ...initialPairing, status: 'creating' });
     setSignalAvailable(null);
     try {
@@ -247,11 +307,10 @@ export function useCameraSystem(
       // The phone must be able to reach this exact origin. When the app runs
       // over a LAN address this embeds the signalling URL as well so the phone
       // talks to the same server even on a different port/host.
-      const url = new URL(window.location.href);
-      url.hash = '';
+      const url = buildPhoneUrl(session);
       url.searchParams.set('pair', session.sessionId);
       url.searchParams.set('token', session.sessionToken);
-      url.searchParams.set('signal', signalBaseUrl());
+      url.searchParams.set('signal', phoneSignalBase(session, url.protocol));
       setPairing({
         status: 'waiting',
         session,
@@ -271,6 +330,8 @@ export function useCameraSystem(
             ? `${err.message} — start it with "npm run signal" (or "npm run dev:signal").`
             : 'Could not create a pairing session.',
       });
+    } finally {
+      pairingInFlight.current = false;
     }
   }, []);
 
@@ -292,8 +353,11 @@ export function useCameraSystem(
       });
       return;
     }
-    sourceRef.current?.stop();
-    engineRef.current?.setSource(null);
+    // Release the previous source *before* building the new one. Otherwise its
+    // late async callbacks (track ended, video ready) can resurrect a stale
+    // element while the new source is already live — two live <video>s, one of
+    // them orphaned in the DOM.
+    releaseSource();
     setFrame(null);
     setError(null);
 
@@ -302,15 +366,37 @@ export function useCameraSystem(
       socketUrl: signalSocketUrl(session.sessionId, 'laptop', session.sessionToken),
       iceServers: session.iceServers,
       onStatus: (s, detail) => {
+        if (sourceRef.current !== source) return;
         setCameraStatus(s);
         if (detail) setStatusDetail(detail);
       },
-      onError: (e) => setError(e),
+      onError: (e) => {
+        if (sourceRef.current !== source) return;
+        setError(e);
+      },
       onTrackInfo: (info) => {
+        if (sourceRef.current !== source) return;
         setTrackInfo({ width: info.width, height: info.height, label: info.label, frameRate: info.frameRate });
       },
       onPeerState: (peerState) => {
+        if (sourceRef.current !== source) return;
         setPairing((prev) => ({ ...prev, peerState, status: peerState === 'connected' ? 'connected' : prev.status }));
+      },
+      // The source object is created before the phone is known, so the engine
+      // must be (re)bound whenever this source acquires or drops its stream.
+      // Without this, detection keeps pointing at the previous session's dead
+      // element after a reconnect while the new video renders fine.
+      onVideoChange: (video) => {
+        if (!video) return;
+        if (sourceRef.current !== source) return; // stale source, ignore
+        setSourceKind(source.kind);
+        if (engineRef.current) {
+          engineRef.current.setSource(source);
+          if (videoRef.current && video.srcObject) {
+            videoRef.current.srcObject = video.srcObject;
+            void videoRef.current.play().catch(() => undefined);
+          }
+        }
       },
     });
     sourceRef.current = source;
@@ -325,7 +411,7 @@ export function useCameraSystem(
     } catch (err) {
       setError(cameraErrorFrom(err));
     }
-  }, [pairing.session]);
+  }, [pairing.session, releaseSource]);
 
   /**
    * Turn on the optional pothole adapter with real, user-supplied weights.
@@ -432,15 +518,36 @@ export function useCameraSystem(
     return () => navigator.mediaDevices.removeEventListener('devicechange', handler);
   }, [refreshDevices]);
 
-  // Full cleanup on unmount: stops tracks, closes peer connections, terminates
-  // the worker, releases the session. Prevents "camera still on" leaks.
+  /*
+   * Full cleanup on unmount: stops tracks, closes peer connections, terminates
+   * the worker.
+   *
+   * The pairing session is deliberately NOT deleted here. React StrictMode
+   * mounts, unmounts and re-mounts effects once at startup, so an unmount-time
+   * DELETE destroyed the session milliseconds after the QR was generated and
+   * every phone scan then failed with `unknown_session`. The session is torn
+   * down explicitly by the user (Disconnect / Cancel) or by the signalling
+   * server's TTL and idle sweeper.
+   */
   useEffect(() => {
     return () => {
       engineRef.current?.dispose();
       sourceRef.current?.stop();
-      const session = pairingSessionRef.current;
-      if (session) void closeCameraSession(session.sessionId, session.sessionToken);
     };
+  }, []);
+
+  // A page that is really closed releases its session immediately. `pagehide`
+  // fires on close/navigation, unlike a React unmount, so this cannot race with
+  // StrictMode.
+  useEffect(() => {
+    const release = () => {
+      const session = pairingSessionRef.current;
+      if (!session) return;
+      pairingSessionRef.current = null;
+      void closeCameraSession(session.sessionId, session.sessionToken);
+    };
+    window.addEventListener('pagehide', release);
+    return () => window.removeEventListener('pagehide', release);
   }, []);
 
   const state = useMemo<CameraSystemState>(

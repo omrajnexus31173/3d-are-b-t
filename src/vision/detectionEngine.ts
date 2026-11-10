@@ -165,6 +165,7 @@ export class DetectionEngine {
   /** Edge length of the loaded model's square input (640 for YOLO, 416 for NanoDet). */
   private inputSize = 640;
   private watchdog: number | null = null;
+  private sourceStalled = false;
 
   private emitModelStatus(patch: Partial<ModelStatus>) {
     this.modelStatus = { ...this.modelStatus, ...patch };
@@ -350,6 +351,28 @@ export class DetectionEngine {
   }
 
   /**
+   * Is the current source actually delivering frames?
+   *
+   * A WebRTC `<video>` keeps its element after the phone disconnects: the track
+   * ends but `srcObject` and the last decoded frame remain, so `videoWidth` is
+   * non-zero forever. Inferring from that would keep scoring a frozen picture and
+   * reporting "detections" of a still image. We therefore treat an ended track as
+   * not live (and resume automatically when a reconnect brings a live track).
+   */
+  private sourceIsDelivering(): boolean {
+    const video = this.source?.video;
+    if (!video) return false;
+    if (video.ended || video.videoWidth <= 0 || video.videoHeight <= 0) return false;
+    const stream = video.srcObject as MediaStream | null;
+    if (stream && typeof stream.getVideoTracks === 'function') {
+      const tracks = stream.getVideoTracks();
+      if (tracks.length === 0) return false;
+      if (!tracks.some((t) => t.readyState === 'live')) return false;
+    }
+    return true;
+  }
+
+  /**
    * Draw the current video frame into a square, aspect-preserving letterbox and
    * return raw RGB bytes. Doing this on the main thread uses the hardware 2D
    * canvas path and keeps the worker free of OffscreenCanvas readback.
@@ -450,13 +473,21 @@ export class DetectionEngine {
       this.scheduleNext();
       return;
     }
-    const video = source.video;
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (!width || !height) {
+    if (!this.sourceIsDelivering()) {
+      // Source stalled (phone disconnected): pause scoring, keep the loop alive
+      // so a reconnect resumes without the user pressing Start again.
+      if (!this.sourceStalled) {
+        this.sourceStalled = true;
+        this.listeners.onError?.('Camera stream stopped — detection paused until it resumes.');
+      }
       this.scheduleNext();
       return;
     }
+    if (this.sourceStalled) this.sourceStalled = false;
+
+    const video = source.video;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
 
     try {
       const { buffer, geometry } = this.grabLetterboxedFrame(video, width, height, this.inputSize);
@@ -686,6 +717,12 @@ export class DetectionEngine {
       hasVideo: Boolean(this.source?.video),
       videoWidth: this.source?.video?.videoWidth ?? 0,
       workerReady: Boolean(this.worker),
+      sourceKind: this.source?.kind ?? null,
+      sourceDelivering: this.sourceIsDelivering(),
+      sourceLiveTracks:
+        (this.source?.video?.srcObject as MediaStream | null)?.getVideoTracks?.().filter(
+          (t) => t.readyState === 'live'
+        ).length ?? 0,
     };
   }
 }
