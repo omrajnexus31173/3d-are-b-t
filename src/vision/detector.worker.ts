@@ -152,12 +152,20 @@ async function handleLoad(msg: Extract<WorkerRequest, { type: 'load' }>) {
        * attempt deadlocks. A host page that drives its own (software-rendered)
        * WebGL scene can starve the worker's GL context exactly like that.
        *
-       * So: probe the CPU backend first (always available, deterministic), and
-       * only opt into WebGL when explicitly requested (VITE_TFJS_BACKEND=webgl)
-       * or when the CPU warm-up fails.
+       * Order is WebGL first, CPU as the verified fallback. Measured on this
+       * project's own pipeline (640x480 -> 416 NanoDet): WebGL 8.1-9.4 s vs CPU
+       * 11.4-13.3 s per inference *even on SwiftShader with no GPU at all*, and
+       * the Phase 2A float32 upload removed the readback stall that used to
+       * deadlock the WebGL path inside the worker. The warm-up still gates it:
+       * a backend that cannot complete one inference within its budget is
+       * discarded and CPU is used instead, so a machine where WebGL genuinely
+       * fails still works.
+       *
+       * VITE_TFJS_BACKEND=cpu forces CPU (useful on machines with a very busy
+       * GPU or a driver known to stall).
        */
-      const requested = (import.meta.env?.VITE_TFJS_BACKEND ?? 'cpu').toLowerCase();
-      const order: ('cpu' | 'webgl')[] = requested === 'webgl' ? ['webgl', 'cpu'] : ['cpu', 'webgl'];
+      const requested = (import.meta.env?.VITE_TFJS_BACKEND ?? 'webgl').toLowerCase();
+      const order: ('cpu' | 'webgl')[] = requested === 'cpu' ? ['cpu', 'webgl'] : ['webgl', 'cpu'];
 
       let lastReason = '';
       for (const backend of order) {

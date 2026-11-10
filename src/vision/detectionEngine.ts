@@ -531,13 +531,28 @@ export class DetectionEngine {
   }
 
   /**
-   * Rolling window for the FPS read-outs. 15 s (not 2 s) so a detector that is
-   * working but slow — e.g. a CPU backend at <1 fps — reports a real non-zero
-   * rate instead of flickering to 0.
+   * Keep the most recent samples inside a window measured on the *same* clock
+   * that produced them. `Date.now()` is epoch-based, `performance.now()` is not,
+   * so mixing the two silently emptied the windows.
    */
-  private trimWindow(list: number[]) {
-    const cutoff = performance.now() - 15_000;
+  private trimWindow(list: number[], clock: () => number = () => Date.now()) {
+    const cutoff = clock() - 30_000;
     while (list.length > 1 && list[0] < cutoff) list.shift();
+  }
+
+  /**
+   * Rate from the actual span of the samples.
+   *
+   * Dividing a sample count by a fixed window overstates throughput whenever
+   * the interval is large: at ~9 s per inference a 15 s window can hold at most
+   * two samples but yields "0.27 fps" where the true rate is ~0.11. Using the
+   * measured span makes the number honest at any speed, fast or slow.
+   */
+  private rateFrom(list: number[]): number {
+    if (list.length < 2) return 0;
+    const span = (list[list.length - 1] - list[0]) / 1000;
+    if (span <= 0) return 0;
+    return (list.length - 1) / span;
   }
 
   private handleWorkerMessage(msg: WorkerResponse) {
@@ -554,7 +569,14 @@ export class DetectionEngine {
         this.latencySamples.reduce((a, b) => a + b, 0) / this.latencySamples.length;
       const sorted = [...this.latencySamples].sort((a, b) => a - b);
       this.stats.p95InferenceMs = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 0;
-      this.inferenceTimestamps.push(msg.timestampMs);
+      /*
+       * Stamp the *completion* time, not the capture time. Pushing
+       * `msg.timestampMs` measured when frames were started, so a 13 s
+       * inference still reported a healthy-looking rate while results arrived
+       * three times a minute. inferenceFps must answer "how often do results
+       * come back", which is what the UI claims.
+       */
+      this.inferenceTimestamps.push(Date.now());
       this.trimWindow(this.inferenceTimestamps);
 
       const frame = this.buildFrame(msg.detections, msg.frameWidth, msg.frameHeight, msg.timestampMs, latency, msg.inferenceMs);
@@ -660,9 +682,8 @@ export class DetectionEngine {
      * the rate at which results actually came back — deliberately separate so a
      * slow backend can't look like a fast one.
      */
-    const windowSeconds = 15;
-    this.stats.captureFps = this.attemptTimestamps.length / windowSeconds;
-    this.stats.inferenceFps = this.inferenceTimestamps.length / windowSeconds;
+    this.stats.captureFps = this.rateFrom(this.attemptTimestamps);
+    this.stats.inferenceFps = this.rateFrom(this.inferenceTimestamps);
 
     return {
       detections,
@@ -710,6 +731,8 @@ export class DetectionEngine {
       inferenceFps: this.stats.inferenceFps,
       captureFps: this.stats.captureFps,
       lastInferenceMs: this.stats.lastInferenceMs,
+      avgInferenceMs: this.stats.avgInferenceMs,
+      p95InferenceMs: this.stats.p95InferenceMs,
       detectionCount: this.stats.detectionCount,
       modelState: this.modelStatus.state,
       backend: this.backend,
@@ -717,6 +740,7 @@ export class DetectionEngine {
       hasVideo: Boolean(this.source?.video),
       videoWidth: this.source?.video?.videoWidth ?? 0,
       workerReady: Boolean(this.worker),
+      executionProvider: this.modelStatus.executionProvider ?? null,
       sourceKind: this.source?.kind ?? null,
       sourceDelivering: this.sourceIsDelivering(),
       sourceLiveTracks:
