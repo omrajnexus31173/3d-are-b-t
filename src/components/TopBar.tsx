@@ -17,7 +17,7 @@ import {
   Wind,
 } from 'lucide-react';
 import { ScenarioId, SensorNoiseConfig } from '../types/simulation';
-import { SCENARIO_LIST_META } from '../simulation/scenarios';
+import { ENDLESS_LIST_META, SCENARIO_LIST_META } from '../simulation/scenarios';
 
 interface TopBarProps {
   activeScenarioId: ScenarioId;
@@ -132,6 +132,27 @@ export const TopBar: React.FC<TopBarProps> = ({
                     : 'bg-slate-600'
                 }`}
               />
+              <span>{sc.shortTitle}</span>
+            </button>
+          );
+        })}
+        {/* Infinite Free Drive: a separate experience, visually distinct so it
+            never reads as a sixth scored scenario. */}
+        <div className="w-px h-5 bg-slate-600/40 mx-0.5" />
+        {ENDLESS_LIST_META.map((sc) => {
+          const isActive = sc.id === activeScenarioId;
+          return (
+            <button
+              key={sc.id}
+              onClick={() => onSelectScenario(sc.id)}
+              title={`${sc.title} — endless procedural road, no goal`}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                isActive
+                  ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-400/50 shadow-sm'
+                  : 'text-emerald-300/80 hover:text-emerald-200 hover:bg-emerald-500/10 border border-emerald-400/25'
+              }`}
+            >
+              <span className="text-[10px] leading-none">∞</span>
               <span>{sc.shortTitle}</span>
             </button>
           );

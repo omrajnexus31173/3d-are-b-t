@@ -48,6 +48,7 @@ export function App() {
     highway_merge: false,
     dense_market: false,
     cattle_crossing: false,
+    infinite_drive: false,
   });
 
   const [layers, setLayers] = useState<LayerVisibility>({

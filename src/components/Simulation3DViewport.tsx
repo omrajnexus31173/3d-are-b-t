@@ -31,6 +31,9 @@ import {
   updateRigAnimation,
 } from '../three/models';
 import { buildScenario3DEnvironment } from '../three/roadBuilder';
+import { InfiniteRoadRenderer } from '../three/infiniteRoadBuilder';
+import { getProceduralTextures } from '../three/textures';
+import { getEndlessRoad, teleportEndlessEgo } from '../simulation/engine';
 import { AutonomyVisualManager, createAutonomyVisuals } from '../three/autonomyVisuals';
 
 export type CameraMode = 'chase' | 'driver' | 'drone' | 'bev';
@@ -138,7 +141,27 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
     hemiLight: THREE.HemisphereLight;
     rainSystem: THREE.Points;
     loadedScenarioId: string;
+    /** Present only while an endless experience is active. */
+    endlessRoad: InfiniteRoadRenderer | null;
+    /** Moving terrain patch that follows the ego in endless mode. */
+    groundApron: THREE.Mesh | null;
   } | null>(null);
+
+  /**
+   * Recursively disposes geometries and materials under an object.
+   *
+   * Materials are shared between some rigs in `models.ts`, so double-disposing
+   * is possible; three.js treats dispose() as idempotent, so this is safe.
+   */
+  const disposeObject = (root: THREE.Object3D) => {
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+      const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else mat?.dispose();
+    });
+  };
 
   // Helper to sync scenario 3D road & static environment whenever scenario changes
   const syncScenarioEnvironment = (scenarioId: string) => {
@@ -155,11 +178,65 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
       ctx.envDispose = null;
     }
 
-    // Clear old agent rigs
+    // Clear old agent rigs (and release their GPU resources)
     ctx.agentRigs.forEach((rig) => {
       ctx.scene.remove(rig.group);
+      disposeObject(rig.group);
     });
     ctx.agentRigs.clear();
+
+    // Tear down whichever environment kind was active.
+    if (ctx.endlessRoad) {
+      ctx.scene.remove(ctx.endlessRoad.group);
+      ctx.endlessRoad.dispose();
+      ctx.endlessRoad = null;
+    }
+    ctx.groundApron = null;
+
+    if (import.meta.env.DEV) {
+      delete (window as unknown as { __endlessRender?: unknown }).__endlessRender;
+    }
+
+    if (sim.scenario.id === 'infinite_drive') {
+      /*
+       * Endless mode draws itself through InfiniteRoadRenderer (pooled meshes,
+       * in-place ribbon buffers). It deliberately does not call
+       * buildScenario3DEnvironment: that builder creates a fixed road ribbon from
+       * a static sample array plus a goal arch, which is wrong for a road that
+       * moves under the vehicle.
+       */
+      const renderer = new InfiniteRoadRenderer();
+      ctx.scene.add(renderer.group);
+      ctx.endlessRoad = renderer;
+      // Keep the terrain plane so the world has ground beyond the shoulders.
+      /*
+       * Ground apron. This is a moving patch rather than a big static plane: a
+       * fixed plane at the origin left the road floating over empty background
+       * once the ego had driven past its edge (clearly visible in the village
+       * block at ~640 m). It is re-centred on the ego every second, which is
+       * invisible at 700 m across with a repeating grass texture.
+       */
+      const groundGeo = new THREE.PlaneGeometry(1400, 1400);
+      groundGeo.rotateX(-Math.PI / 2);
+      const groundMat = new THREE.MeshStandardMaterial({
+        map: getProceduralTextures().terrainGrass,
+        roughness: 0.95,
+      });
+      const ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.name = 'endless_ground';
+      ground.position.y = -0.05;
+      ctx.groundApron = ground;
+      const groundGroup = new THREE.Group();
+      groundGroup.add(ground);
+      ctx.scene.add(groundGroup);
+      ctx.envGroup = groundGroup;
+      ctx.envDispose = () => {
+        groundGeo.dispose();
+        groundMat.dispose();
+      };
+      ctx.loadedScenarioId = scenarioId;
+      return;
+    }
 
     // Build new 3D road environment
     const built = buildScenario3DEnvironment(sim.scenario);
@@ -168,6 +245,21 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
     ctx.envDispose = built.dispose;
     ctx.loadedScenarioId = scenarioId;
   };
+
+  // Dev-only handle for the endless-road acceptance scripts. Vite strips this
+  // block from a production build because import.meta.env.DEV is false.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const api = window as unknown as { __endlessTest?: unknown; __endlessTeleport?: unknown };
+    api.__endlessTest = {
+      teleport: (targetS: number) => teleportEndlessEgo(simStateRef.current, targetS),
+    };
+    api.__endlessTeleport = api.__endlessTest;
+    return () => {
+      delete api.__endlessTest;
+      delete api.__endlessTeleport;
+    };
+  }, []);
 
   // Initialize Three.js WebGL Pipeline once
   useEffect(() => {
@@ -288,6 +380,8 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
       envGroup: null,
       envDispose: null,
       agentRigs: new Map(),
+      endlessRoad: null,
+      groundApron: null,
       egoRig,
       autonomyVisuals,
       dirLight,
@@ -434,6 +528,34 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
       dirLight.target.position.set(ego.x + 10, 0, ego.y);
       dirLight.target.updateMatrixWorld();
 
+      if (ctx3d.groundApron) {
+        // Snap to a 50 m grid so the repeating texture does not visibly swim.
+        const gx = Math.round(ego.x / 50) * 50;
+        const gy = Math.round(ego.y / 50) * 50;
+        ctx3d.groundApron.position.x = gx;
+        ctx3d.groundApron.position.z = gy;
+      }
+
+      // 1b. Endless road: refill pooled geometry from the live chunk window.
+      if (ctx3d.endlessRoad) {
+        const road = getEndlessRoad(sim);
+        if (road) ctx3d.endlessRoad.sync(road.allChunks, { x: ego.x, y: ego.y });
+        // Dev-only diagnostic used by the endless-road acceptance scripts. Not
+        // present in a production build (import.meta.env.DEV is false).
+        if (import.meta.env.DEV) {
+          const w = window as unknown as { __endlessRender?: unknown; __endlessRenderAt?: number };
+          if (w.__endlessRenderAt !== Math.floor(nowSec)) {
+            w.__endlessRenderAt = Math.floor(nowSec);
+            w.__endlessRender = {
+              ...ctx3d.endlessRoad.stats(),
+              drawCalls: renderer.info.render.calls,
+              triangles: renderer.info.render.triangles,
+              agentRigs: ctx3d.agentRigs.size,
+            };
+          }
+        }
+      }
+
       // 2. Sync Agent 3D Rigs (create dynamically for newly injected hazards)
       const activeIds = new Set<string>();
       for (let i = 0; i < sim.agents.length; i++) {
@@ -450,10 +572,19 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
         updateRigAnimation(rig, ag.speed, dt, 0, 0, false, 'none', nowSec);
       }
 
-      // Remove stale agent rigs if any
+      /*
+       * Remove stale agent rigs.
+       *
+       * Endless mode churns through hundreds of agents over a drive, so this
+       * path now actually releases GPU resources. Previously it only detached
+       * the group from the scene, leaving its geometries and materials alive for
+       * every despawned agent - an unbounded leak that only shows up on a long
+       * endless drive.
+       */
       ctx3d.agentRigs.forEach((rig, id) => {
         if (!activeIds.has(id)) {
           ctx3d.scene.remove(rig.group);
+          disposeObject(rig.group);
           ctx3d.agentRigs.delete(id);
         }
       });
@@ -728,6 +859,50 @@ export const Simulation3DViewport: React.FC<Simulation3DViewportProps> = ({
 
       {/* TOP-LEFT HUD: Planner State, Collision Risk & Speed Telemetry */}
       <div className="absolute top-3 left-3 flex flex-col gap-2 max-w-[475px] pointer-events-none">
+        {uiSnapshot.roadWindow && (
+          <div
+            className="bg-[#0E1420]/92 backdrop-blur-md border border-emerald-400/35 rounded-lg px-2.5 py-2 shadow-xl"
+            data-testid="endless-road-hud"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-[10px] font-mono-tech font-bold uppercase tracking-wider text-emerald-300 flex items-center gap-1">
+                ∞ ENDLESS ROAD
+              </span>
+              <span className="text-[9px] font-mono-tech text-slate-400">
+                seed {uiSnapshot.roadWindow.seed}
+              </span>
+            </div>
+            <div className="mt-1 grid grid-cols-4 gap-x-3 gap-y-0.5 text-[9.5px] font-mono-tech">
+              <span className="text-slate-500">ENV</span>
+              <span className="text-slate-200 capitalize" data-testid="endless-env">
+                {uiSnapshot.roadWindow.currentEnvironment}
+              </span>
+              <span className="text-slate-500">SEGMENTS</span>
+              <span className="text-amber-200" data-testid="endless-chunks">
+                {uiSnapshot.roadWindow.activeChunks}
+              </span>
+              <span className="text-slate-500">AHEAD</span>
+              <span className="text-slate-200">
+                {Math.max(0, Math.round(uiSnapshot.roadWindow.windowEndS - uiSnapshot.ego.s))} m
+              </span>
+              <span className="text-slate-500">DIST</span>
+              <span className="text-slate-200">
+                {(uiSnapshot.ego.s / 1000).toFixed(2)} km
+              </span>
+              <span className="text-slate-500">TRAFFIC</span>
+              <span className="text-slate-200" data-testid="endless-agents">
+                {uiSnapshot.roadWindow.activeAgents}
+              </span>
+              <span className="text-slate-500">GEN/REC</span>
+              <span className="text-slate-300">
+                {uiSnapshot.roadWindow.chunksGenerated}/{uiSnapshot.roadWindow.chunksRecycled}
+              </span>
+            </div>
+            <div className="mt-1 text-[8.5px] font-mono-tech text-slate-500">
+              Procedural hazards here are simulated only — never camera detections
+            </div>
+          </div>
+        )}
         <div className="bg-[#0E1420]/88 backdrop-blur-md border border-slate-400/20 rounded-xl px-3 py-2 shadow-2xl">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-1.5">
