@@ -12,6 +12,9 @@ import {
   worldToFrenet,
 } from './roadMath';
 import { createRoadAgent, createScenario, SCENARIO_IDS } from './scenarios';
+import { DEFAULT_ENDLESS_TRAFFIC, EndlessRoadController } from './endlessRoad';
+import { DEFAULT_INFINITE_CONFIG, InfiniteRoadConfig } from './infiniteRoad';
+import { InfiniteRoad } from './infiniteRoadManager';
 import {
   EgoVehicle,
   RoadAgent,
@@ -21,7 +24,53 @@ import {
   SensorNoiseConfig,
   SimLogEntry,
   SimulationState,
+  isEndlessScenario,
 } from '../types/simulation';
+
+/**
+ * Live endless-road controllers, keyed by scenario. The public `SimulationState`
+ * shape stays serialisable and snapshot-friendly (only plain stats are exposed),
+ * while the stateful generator lives here. A WeakMap keyed by the state object
+ * keeps one controller per simulation and lets it be collected with the state.
+ */
+const endlessControllers = new WeakMap<object, EndlessRoadController>();
+const endlessSeeds = new WeakMap<object, number>();
+
+export function getEndlessRoad(state: SimulationState): InfiniteRoad | null {
+  return endlessControllers.get(state)?.road ?? null;
+}
+
+/**
+ * Teleports the ego to a target arc length. Test/debug affordance only - the
+ * endless window is ~780 m and each environment block is 3 x 60 m, so reaching
+ * the urban, rural and village blocks by driving takes minutes of real time on a
+ * software renderer. Physics is unaffected: the ego keeps its speed and heading
+ * for the new road tangent, which is exactly what a respawn at that point would
+ * give. Not exposed in the production UI.
+ */
+export function teleportEndlessEgo(state: SimulationState, targetS: number): boolean {
+  const controller = endlessControllers.get(state);
+  if (!controller) return false;
+  /*
+   * Forward only. Jumping backwards past the retained window made
+   * `InfiniteRoad.update` drop every chunk and then top up *forwards* from the
+   * last generated index, so the window no longer contained the ego's own arc
+   * length - the HUD then reported an environment that did not match the road
+   * under the car. Rather than special-case reverse traversal, the debug
+   * affordance simply refuses it.
+   */
+  if (targetS <= state.ego.s) return false;
+  const road = controller.road;
+  road.update(targetS);
+  state.scenario.roadSamples = road.samples();
+  state.scenario.totalLengthM = road.windowEndS - road.windowStartS;
+  const pose = frenetToWorld(state.scenario.roadSamples, targetS, state.ego.d);
+  state.ego.x = pose.x;
+  state.ego.y = pose.y;
+  state.ego.theta = pose.theta;
+  state.ego.s = targetS;
+  return true;
+}
 
 function computePercentile(values: number[], p: number): number {
   if (values.length === 0) return 0;
@@ -34,7 +83,18 @@ export function createInitialSimulationState(
   scenarioId: ScenarioId,
   running = true
 ): SimulationState {
-  const scenario = createScenario(scenarioId);
+  let scenario = createScenario(scenarioId);
+
+  let endless: EndlessRoadController | null = null;
+  if (isEndlessScenario(scenarioId)) {
+    const config: InfiniteRoadConfig = { ...DEFAULT_INFINITE_CONFIG };
+    const road = new InfiniteRoad(config);
+    road.update(scenario.initialEgoS);
+    endless = new EndlessRoadController(road, { config: DEFAULT_ENDLESS_TRAFFIC, seed: config.seed });
+    scenario = { ...scenario, roadSamples: road.samples(), totalLengthM: road.windowEndS - road.windowStartS };
+    endlessSeeds.set(scenario, config.seed);
+  }
+
   const startPose = frenetToWorld(
     scenario.roadSamples,
     scenario.initialEgoS,
@@ -83,7 +143,7 @@ export function createInitialSimulationState(
     message: `Initialized ${scenario.title} — Multi-sensor fusion active (${perception.trackedObjects.length} tracks)`,
   };
 
-  return {
+  const state: SimulationState = {
     scenario,
     ego,
     agents,
@@ -132,7 +192,22 @@ export function createInitialSimulationState(
     lastPlannerState: planner.state,
     nextLogId: 2,
     injectedCount: 0,
+    roadWindow: endless
+      ? {
+          ...endless.road.stats(scenario.initialEgoS),
+          vehiclesSpawned: 0,
+          vehiclesDespawned: 0,
+          activeAgents: agents.length,
+        }
+      : undefined,
   };
+
+  if (endless) {
+    endlessControllers.set(state, endless);
+    endlessSeeds.delete(scenario);
+  }
+
+  return state;
 }
 
 function stepAgents(
@@ -342,6 +417,18 @@ export function stepSimulation(
 
   const { ego, agents, scenario } = state;
 
+  /*
+   * Endless mode: advance the procedural window and reconcile traffic *before*
+   * agents step, so newly spawned traffic moves on the same tick it appears and
+   * the planner always sees a continuous road under the ego. This reuses the
+   * same scenario.roadSamples / agents arrays the rest of the step consumes -
+   * it is not a second simulation.
+   */
+  const endless = endlessControllers.get(state);
+  if (endless) {
+    endless.step(scenario, ego, agents, dt);
+  }
+
   // 1. Advance surrounding agents
   stepAgents(agents, ego, scenario.roadSamples, dt, state.metrics.simTime);
 
@@ -435,17 +522,37 @@ export function stepSimulation(
   state.metrics.meanCurvature = state.curvatureSum / state.sampleCount;
   state.metrics.meanSpeedKmh = state.speedSum / state.sampleCount;
 
-  const progress = clamp(
-    ((ego.s - scenario.initialEgoS) / (scenario.goalS - scenario.initialEgoS)) * 100,
-    0,
-    100
-  );
-  state.metrics.progressPct = progress;
+  if (isEndlessScenario(scenario.id)) {
+    /*
+     * Endless experiences never complete and have no progress bar to fill
+     * against a goal. Distance driven is the honest read-out instead; it is
+     * stored in progressPct's place only as a "no goal" marker of 0, so the
+     * existing UI keeps showing the road as ongoing rather than finished.
+     */
+    state.metrics.progressPct = 0;
+    if (endless) {
+      const roadStats = endless.road.stats(ego.s);
+      const traffic = endless.stats();
+      state.roadWindow = {
+        ...roadStats,
+        vehiclesSpawned: traffic.spawned,
+        vehiclesDespawned: traffic.despawned,
+        activeAgents: agents.length,
+      };
+    }
+  } else {
+    const progress = clamp(
+      ((ego.s - scenario.initialEgoS) / (scenario.goalS - scenario.initialEgoS)) * 100,
+      0,
+      100
+    );
+    state.metrics.progressPct = progress;
 
-  if (state.planner.state === 'GOAL_REACHED' || ego.s >= scenario.goalS - 2.0) {
-    state.metrics.completed = true;
-    state.metrics.progressPct = 100;
-    state.metrics.passed = state.metrics.collisions === 0;
+    if (state.planner.state === 'GOAL_REACHED' || ego.s >= scenario.goalS - 2.0) {
+      state.metrics.completed = true;
+      state.metrics.progressPct = 100;
+      state.metrics.passed = state.metrics.collisions === 0;
+    }
   }
 
   // Record sparkline telemetry every ~0.15s

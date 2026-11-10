@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-ssr/
+
+# runtime-fetched detection assets (large binaries — install with `npm run setup:models`)
+public/models/
+public/vendor/
+
+# tool caches
+.cache-models/
+.vite/
+
+# editor / os
+.DS_Store
+*.local
+*.log

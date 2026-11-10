@@ -17,7 +17,7 @@ import {
   Wind,
 } from 'lucide-react';
 import { ScenarioId, SensorNoiseConfig } from '../types/simulation';
-import { SCENARIO_LIST_META } from '../simulation/scenarios';
+import { ENDLESS_LIST_META, SCENARIO_LIST_META } from '../simulation/scenarios';
 
 interface TopBarProps {
   activeScenarioId: ScenarioId;
@@ -39,6 +39,8 @@ interface TopBarProps {
   onCycleWeather: () => void;
   onOpenValidation: () => void;
   onOpenReport: () => void;
+  /** Operating-mode selector (Simulation / Real Camera / Hybrid). */
+  modeControl?: React.ReactNode;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -61,6 +63,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onCycleWeather,
   onOpenValidation,
   onOpenReport,
+  modeControl,
 }) => {
   const weatherLabel =
     weatherMode === 'clear'
@@ -94,6 +97,16 @@ export const TopBar: React.FC<TopBarProps> = ({
         </div>
       </div>
 
+      {/* Operating mode: Simulation / Real Camera / Hybrid */}
+      {modeControl && (
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[9px] font-mono-tech uppercase tracking-wider text-slate-500 hidden 2xl:inline">
+            Mode
+          </span>
+          {modeControl}
+        </div>
+      )}
+
       {/* Center: 5 Scenario Selector Pills */}
       <nav className="flex items-center gap-1 bg-[#0B0F17] p-1 rounded-lg border border-slate-400/15 shrink-0">
         {SCENARIO_LIST_META.map((sc) => {
@@ -119,6 +132,27 @@ export const TopBar: React.FC<TopBarProps> = ({
                     : 'bg-slate-600'
                 }`}
               />
+              <span>{sc.shortTitle}</span>
+            </button>
+          );
+        })}
+        {/* Infinite Free Drive: a separate experience, visually distinct so it
+            never reads as a sixth scored scenario. */}
+        <div className="w-px h-5 bg-slate-600/40 mx-0.5" />
+        {ENDLESS_LIST_META.map((sc) => {
+          const isActive = sc.id === activeScenarioId;
+          return (
+            <button
+              key={sc.id}
+              onClick={() => onSelectScenario(sc.id)}
+              title={`${sc.title} — endless procedural road, no goal`}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                isActive
+                  ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-400/50 shadow-sm'
+                  : 'text-emerald-300/80 hover:text-emerald-200 hover:bg-emerald-500/10 border border-emerald-400/25'
+              }`}
+            >
+              <span className="text-[10px] leading-none">∞</span>
               <span>{sc.shortTitle}</span>
             </button>
           );

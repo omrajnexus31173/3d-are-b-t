@@ -12,9 +12,17 @@ import {
   Terminal,
 } from 'lucide-react';
 import { SimulationState, TelemetryPoint } from '../types/simulation';
+import type { PerceptionSummary } from '../vision/hybrid';
+import type { OperatingMode } from '../vision/types';
 
 interface TelemetrySidebarProps {
   sim: SimulationState;
+  /**
+   * Fused camera+simulation summary (hybrid / camera modes). Optional so the
+   * component keeps working unchanged in pure simulation mode.
+   */
+  summary?: PerceptionSummary;
+  mode?: OperatingMode;
 }
 
 function buildSparklinePath(
@@ -39,8 +47,11 @@ function buildSparklinePath(
     .join(' ');
 }
 
-export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim }) => {
+export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim, summary, mode = 'simulation' }) => {
   const { metrics, telemetryHistory, perception, logs } = sim;
+  const cameraOnly = mode === 'camera';
+  const simulatedCount = summary ? summary.simulatedCount : perception.trackedObjects.length;
+  const cameraCount = summary ? summary.cameraCount : 0;
 
   const replanMaxScale = Math.max(22, metrics.maxReplanMs * 1.1);
   const replanPath = buildSparklinePath(
@@ -122,13 +133,18 @@ export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim }) => {
             </div>
           </div>
           <div className="bg-[#0B0F17] border border-slate-400/10 rounded-lg p-1.5">
-            <div className="text-[9.5px] text-slate-400">Detected Objects</div>
+            <div className="text-[9.5px] text-slate-400">
+              {cameraCount > 0 ? 'Detected (SIM + CAM)' : 'Detected Objects'}
+            </div>
             <div className="text-sm font-bold font-mono-tech text-slate-100">
               {perception.trackedObjects.length}{' '}
-              <span className="text-[9.5px] font-normal text-amber-300">
-                ({vruCount} VRU)
-              </span>
+              <span className="text-[9.5px] font-normal text-amber-300">({vruCount} VRU)</span>
             </div>
+            {cameraCount > 0 && (
+              <div className="text-[8.5px] font-mono-tech text-slate-500 leading-tight">
+                SIM {simulatedCount} · <span className="text-emerald-400">CAM {cameraCount}</span>
+              </div>
+            )}
           </div>
           <div className="bg-[#0B0F17] border border-slate-400/10 rounded-lg p-1.5">
             <div className="text-[9.5px] text-slate-400">Control Mode</div>
@@ -332,7 +348,7 @@ export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim }) => {
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
             <Radio className="w-3.5 h-3.5 text-cyan-400" />
-            <span>IDD Multi-Sensor Tracker ({perception.trackedObjects.length})</span>
+            <span>{cameraOnly ? 'Camera Tracker' : 'IDD Multi-Sensor Tracker'} ({perception.trackedObjects.length})</span>
           </h2>
           <div className="flex items-center gap-1 text-[9px] font-mono-tech">
             <span className="px-1 py-0.5 rounded bg-cyan-500/15 text-cyan-300">LiDAR</span>
@@ -365,7 +381,17 @@ export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim }) => {
 
                 return (
                   <tr key={obj.id} className="hover:bg-slate-800/40">
-                    <td className="py-1 px-2 text-slate-300">{obj.trackId}</td>
+                    <td className="py-1 px-2">
+                      <span className="flex items-center gap-1">
+                        <span
+                          className={`w-1 h-1 rounded-full ${
+                            obj.trackId.startsWith('CAM-') ? 'bg-emerald-400' : 'bg-cyan-400'
+                          }`}
+                          title={obj.trackId.startsWith('CAM-') ? 'Real camera detection' : 'Simulated sensor fusion'}
+                        />
+                        <span className="text-slate-300">{obj.trackId}</span>
+                      </span>
+                    </td>
                     <td className="py-1 px-1.5 text-slate-200 capitalize truncate max-w-[85px]">
                       {obj.agentClass.replace('_', ' ')}
                     </td>
@@ -397,7 +423,8 @@ export const TelemetrySidebar: React.FC<TelemetrySidebarProps> = ({ sim }) => {
             <Cpu className="w-3 h-3 text-slate-400" /> Fusion: {perception.sensorLatencyMs.toFixed(1)}ms
           </span>
           <span className="flex items-center gap-1">
-            <ShieldCheck className="w-3 h-3 text-emerald-400" /> IDD-Net Active
+            <ShieldCheck className="w-3 h-3 text-emerald-400" />
+            {cameraCount > 0 ? 'SIM + CAM (separated)' : cameraOnly ? 'Camera CV' : 'IDD-Net Active'}
           </span>
         </div>
       </section>

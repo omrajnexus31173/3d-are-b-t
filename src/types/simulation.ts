@@ -3,7 +3,13 @@ export type ScenarioId =
   | 'urban_intersection'
   | 'highway_merge'
   | 'dense_market'
-  | 'cattle_crossing';
+  | 'cattle_crossing'
+  | 'infinite_drive';
+
+/** True for experiences that never end (no goal line, no completion). */
+export function isEndlessScenario(id: ScenarioId): boolean {
+  return id === 'infinite_drive';
+}
 
 export type AgentClass =
   | 'car'
@@ -52,6 +58,11 @@ export interface RoadSample {
   shoulderLeft: number; // unpaved usable shoulder width on left
   shoulderRight: number; // unpaved usable shoulder width on right
   hasLaneMarks: boolean;
+  /** Raised median width, 0 where there is none. Optional for backwards
+   *  compatibility with the finite scenarios, which never use a median. */
+  medianWidth?: number;
+  /** Raised kerbed sidewalk width per side, 0 where there is none. */
+  sidewalkWidth?: number;
 }
 
 export interface CrossRoadSegment {
@@ -337,4 +348,27 @@ export interface SimulationState {
   lastPlannerState: PlannerState;
   nextLogId: number;
   injectedCount: number;
+  /**
+   * Present only in endless experiences. The scenario's `roadSamples` is a live
+   * window into this, refreshed every step, and `agents` is the active traffic
+   * set that spawns ahead of the ego and despawns behind it.
+   */
+  roadWindow?: InfiniteRoadSnapshot;
+}
+
+export interface InfiniteRoadSnapshot {
+  activeChunks: number;
+  coveredLengthM: number;
+  windowStartS: number;
+  windowEndS: number;
+  chunksGenerated: number;
+  chunksRecycled: number;
+  currentEnvironment: string;
+  sceneryItems: number;
+  hazardItems: number;
+  seed: number;
+  /** Traffic agents spawned / despawned so far. */
+  vehiclesSpawned: number;
+  vehiclesDespawned: number;
+  activeAgents: number;
 }

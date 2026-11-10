@@ -8,6 +8,8 @@ import {
   ScenarioId,
 } from '../types/simulation';
 import { buildRoadFromControlPoints, frenetToWorld } from './roadMath';
+import { DEFAULT_INFINITE_CONFIG } from './infiniteRoad';
+import { InfiniteRoad } from './infiniteRoadManager';
 
 const AGENT_PRESETS: Record<
   AgentClass,
@@ -793,6 +795,8 @@ export const SCENARIO_IDS: ScenarioId[] = [
 
 export function createScenario(id: ScenarioId): ScenarioDefinition {
   switch (id) {
+    case 'infinite_drive':
+      return buildInfiniteDriveScenario();
     case 'village_road':
       return buildVillageRoad();
     case 'urban_intersection':
@@ -806,6 +810,7 @@ export function createScenario(id: ScenarioId): ScenarioDefinition {
   }
 }
 
+/** The five scored, finite scenarios shown in the main selector row. */
 export const SCENARIO_LIST_META = SCENARIO_IDS.map((id) => {
   const s = createScenario(id);
   return {
@@ -817,3 +822,72 @@ export const SCENARIO_LIST_META = SCENARIO_IDS.map((id) => {
     keyChallenges: s.keyChallenges,
   };
 });
+
+/**
+ * Endless experiences are listed separately so they never look like a sixth
+ * scored scenario — they have no goal, no completion and no pass/fail.
+ */
+export const ENDLESS_LIST_META = (['infinite_drive'] as ScenarioId[]).map((id) => {
+  const s = createScenario(id);
+  return {
+    id: s.id,
+    code: s.code,
+    title: s.title,
+    shortTitle: s.shortTitle,
+    roadType: s.roadType,
+    keyChallenges: s.keyChallenges,
+  };
+});
+
+// ============================================================================
+// EXPERIENCE 6: INFINITE FREE DRIVE (endless procedural road)
+// ============================================================================
+/**
+ * The endless experience. There is no goal: `goalS` is deliberately far beyond
+ * anything reachable (the ego would have to drive ~1.4 million km) so every
+ * existing goal check, progress calculation and planner branch keeps working
+ * untouched, while `isEndlessScenario()` lets the engine swap in live-window
+ * semantics.
+ *
+ * `roadSamples` here is only a seed window; the engine replaces it each step
+ * with the live window from the InfiniteRoad manager.
+ */
+function buildInfiniteDriveScenario(): ScenarioDefinition {
+  resetAgentCounter();
+  const road = new InfiniteRoad(DEFAULT_INFINITE_CONFIG);
+  road.update(0);
+  const samples = road.samples();
+
+  const agents: RoadAgent[] = [];
+
+  return {
+    id: 'infinite_drive',
+    code: 'EXP-06',
+    title: 'Infinite Free Drive',
+    shortTitle: 'Free Drive',
+    description:
+      'Endless procedurally generated road. Highway, urban, rural and village sections recycle indefinitely ahead of the vehicle with seeded scenery, mixed traffic and roadside hazards.',
+    roadType: 'Procedural corridor — highway / urban / rural / village',
+    keyChallenges: [
+      'Endless road with no endpoint',
+      'Seeded, reproducible generation',
+      'Mixed traffic with bounded population',
+      'Potholes, obstacles and temporary barriers',
+    ],
+    speedLimitKmh: 80,
+    totalLengthM: road.windowEndS,
+    roadSamples: samples,
+    crossRoads: [],
+    props: [],
+    initialAgents: agents,
+    initialEgoS: 12,
+    initialEgoD: -1.8,
+    initialEgoSpeed: 55 / 3.6,
+    // Effectively unreachable: 1.4 million km. Prevents every goal-based stop
+    // from ever firing without special-casing those checks.
+    goalS: 1.4e9,
+    surfaceTint: '#252B36',
+    terrainTint: '#17201B',
+    shoulderTint: '#4A3F32',
+  };
+}

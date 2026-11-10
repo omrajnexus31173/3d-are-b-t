@@ -12,6 +12,12 @@ import {
   stepSimulation,
 } from './simulation/engine';
 import { SCENARIO_IDS } from './simulation/scenarios';
+import { CameraPanel } from './components/camera/CameraPanel';
+import { ModeSwitcher } from './components/camera/ModeSwitcher';
+import { useCameraSystem } from './camera/useCameraSystem';
+import { CameraDetectionPanel } from './components/camera/CameraDetectionPanel';
+import { cameraDetectionsToTrackedObjects, summarisePerception } from './vision/hybrid';
+import type { ModelStatus } from './vision/types';
 import {
   LayerVisibility,
   ScenarioId,
@@ -42,6 +48,7 @@ export function App() {
     highway_merge: false,
     dense_market: false,
     cattle_crossing: false,
+    infinite_drive: false,
   });
 
   const [layers, setLayers] = useState<LayerVisibility>({
@@ -56,6 +63,12 @@ export function App() {
 
   const [validationOpen, setValidationOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<'telemetry' | 'camera'>('telemetry');
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const simTimeRef = useRef(0);
+
+  const { state: cameraState, actions: cameraActions, videoRef, engineRef } =
+    useCameraSystem(simTimeRef);
 
   const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -197,6 +210,7 @@ export function App() {
       accumulator += elapsedSec * simSpeed;
 
       const sim = simStateRef.current;
+      simTimeRef.current = sim.metrics.simTime;
       const noiseCfg = getNoiseConfig();
 
       let stepsThisFrame = 0;
@@ -257,6 +271,58 @@ export function App() {
     }
   }, [autoDemo, uiSnapshot.metrics.completed, activeScenarioId, loadScenario]);
 
+  // ---------------------------------------------------------------------
+  // Hybrid perception: the simulation keeps producing metre-based ground
+  // truth; camera detections are adapted into the same TrackedObject shape but
+  // stay clearly separated (CAM- ids, Camera-only detection source).
+  // ---------------------------------------------------------------------
+  const cameraTrackedObjects = cameraDetectionsToTrackedObjects(cameraState.frame?.detections ?? []);
+  const showSimulationWorld = cameraState.mode !== 'camera';
+  const showCameraWorld = cameraState.mode !== 'simulation';
+  const simulationObjects = showSimulationWorld ? uiSnapshot.perception.trackedObjects : [];
+  const mergedCameraObjects = showCameraWorld ? cameraTrackedObjects : [];
+  const perceptionSummary = summarisePerception(simulationObjects, mergedCameraObjects);
+
+  const hybridSnapshot = showSimulationWorld
+    ? {
+        ...uiSnapshot,
+        perception: {
+          ...uiSnapshot.perception,
+          trackedObjects: [...simulationObjects, ...mergedCameraObjects],
+        },
+      }
+    : {
+        ...uiSnapshot,
+        perception: {
+          ...uiSnapshot.perception,
+          trackedObjects: mergedCameraObjects,
+          sensorLatencyMs: cameraState.frame?.stats.lastInferenceMs ?? 0,
+        },
+        metrics: {
+          ...uiSnapshot.metrics,
+          obstacleDetections: mergedCameraObjects.length,
+        },
+      };
+
+  const handleLoadModel = async () => {
+    const status = await cameraActions.loadModel();
+    setModelStatus(status);
+  };
+
+  const handleUploadPothole = async (file: File) => {
+    // Pothole weights are user supplied. We load them through the ONNX backend
+    // and report honestly when that runtime is unavailable in this browser —
+    // pothole detection then stays explicitly disabled rather than "faked".
+    const status = await cameraActions.loadPotholeModel(file);
+    setModelStatus(status);
+    if (status.state !== 'ready') {
+      throw new Error(
+        `${file.name}: ${status.message ?? 'model could not be loaded'}. ` +
+          'Pothole detection stays disabled (no detections are invented).'
+      );
+    }
+  };
+
   return (
     <div className="min-h-screen lg:h-screen lg:overflow-hidden flex flex-col bg-[#0B0F17] text-slate-100">
       <TopBar
@@ -297,6 +363,17 @@ export function App() {
         onCycleWeather={handleCycleWeather}
         onOpenValidation={() => setValidationOpen(true)}
         onOpenReport={() => setReportOpen(true)}
+        modeControl={
+          <ModeSwitcher
+            mode={cameraState.mode}
+            onChange={(m) => {
+              cameraActions.setMode(m);
+              if (m !== 'simulation') setSidebarTab('camera');
+            }}
+            cameraLive={cameraState.cameraStatus === 'live'}
+            detecting={cameraState.detecting}
+          />
+        }
       />
 
       {/* Main Split Workspace: Interactive 3D WebGL Viewport (or 2D Tactical View) + Diagnostics Sidebar */}
@@ -327,7 +404,61 @@ export function App() {
           )}
         </div>
 
-        <TelemetrySidebar sim={uiSnapshot} />
+        <aside className="w-full lg:w-[410px] xl:w-[430px] shrink-0 h-full bg-[#0E1420] border-l border-slate-400/15 flex flex-col overflow-hidden">
+          <div className="flex items-center gap-1 p-1.5 border-b border-slate-400/15 bg-[#111827]">
+            <button
+              onClick={() => setSidebarTab('telemetry')}
+              className={`flex-1 px-2 py-1 rounded-md text-[10.5px] font-semibold cursor-pointer transition-colors ${
+                sidebarTab === 'telemetry'
+                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/40'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              Telemetry & Planner
+            </button>
+            <button
+              onClick={() => setSidebarTab('camera')}
+              className={`flex-1 px-2 py-1 rounded-md text-[10.5px] font-semibold cursor-pointer transition-colors flex items-center justify-center gap-1 ${
+                sidebarTab === 'camera'
+                  ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/40'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              Live Camera
+              {cameraState.detecting && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              )}
+            </button>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto telemetry-scroll">
+            {sidebarTab === 'telemetry' ? (
+              <div className="flex flex-col">
+                {cameraState.mode !== 'simulation' && mergedCameraObjects.length > 0 && (
+                  <div className="p-2.5 pb-0">
+                    <CameraDetectionPanel
+                      frame={cameraState.frame}
+                      detecting={cameraState.detecting}
+                      cameraLive={cameraState.cameraStatus === 'live'}
+                      modelReady={cameraState.modelLoadState === 'ready'}
+                    />
+                  </div>
+                )}
+                <TelemetrySidebar sim={hybridSnapshot} summary={perceptionSummary} mode={cameraState.mode} />
+              </div>
+            ) : (
+              <div className="p-2.5">
+                <CameraPanel
+                  state={cameraState}
+                  actions={cameraActions}
+                  videoRef={videoRef}
+                  modelStatus={modelStatus ?? engineRef.current?.getModelStatus() ?? null}
+                  onLoadModel={() => void handleLoadModel()}
+                  onUploadPothole={handleUploadPothole}
+                />
+              </div>
+            )}
+          </div>
+        </aside>
       </main>
 
       <ValidationModal

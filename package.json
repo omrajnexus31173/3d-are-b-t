@@ -1,31 +1,45 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "bharat-av",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:https": "BHARAT_HTTPS=1 vite",
+    "dev:signal": "concurrently -k -n signal,vite -c magenta,cyan \"node server/signal-server.mjs\" \"vite\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "signal": "node server/signal-server.mjs",
+    "setup:models": "node scripts/setup-models.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@types/three": "^0.187.0",
     "clsx": "2.1.1",
     "lucide-react": "^1.70.0",
+    "onnxruntime-web": "^1.23.0",
+    "qrcode-generator": "^2.0.4",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "tailwind-merge": "3.4.0",
-    "three": "^0.187.0"
+    "three": "^0.187.0",
+    "ws": "^8.18.2"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
     "@vitejs/plugin-react": "5.1.1",
+    "concurrently": "^9.2.5",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.3.2",
-    "vite-plugin-singlefile": "2.3.0"
+    "vite-plugin-singlefile": "2.3.0",
+    "vitest": "^5.1.0"
   }
 }
