@@ -74,6 +74,68 @@ export interface SignalBaseInputs {
  * exists inside the Vite dev server — on a static host it 404s, and the failure
  * surfaced to operators as a misleading "start it with npm run signal" message.
  */
+/**
+ * The server mounts every endpoint under `/signal` (`/signal/health`,
+ * `/signal/session`, `/signal/ws`). This constant is the single place that
+ * knowledge lives on the client.
+ */
+export const SIGNAL_PATH = '/signal';
+
+/**
+ * Normalise a signalling base URL so it ends with `/signal` exactly once.
+ *
+ * Why this exists: every consumer appends a route to the base
+ * (`${base}/health`, `${base}/session`, `${base}/ws`). The base therefore has to
+ * include the `/signal` mount point. Operators naturally set
+ * `VITE_SIGNAL_URL` to the bare origin, which produced
+ * `https://host/health` → 404 and `https://host/session` → 404 while the server
+ * itself was healthy at `/signal/health` — a silent, confusing failure that
+ * looked like a CORS or connectivity problem.
+ *
+ * Accepting both forms is deliberate. Requiring the mount point to be typed into
+ * an environment variable makes a one-character mistake indistinguishable from
+ * an outage. Normalising once, here, means:
+ *   - the bare origin works                       (the intuitive value)
+ *   - the explicit `/signal` form works           (self-documenting)
+ *   - a trailing slash is tolerated               (pasted from a browser)
+ *   - `/signal/signal` cannot be produced         (the obvious over-correction)
+ *
+ * The development proxy path already ends in `/signal` (see `vite.config.ts`,
+ * which strips `/signal-proxy` before forwarding), so it passes through intact.
+ */
+export function normaliseSignalBase(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, '');
+  if (!trimmed) return trimmed;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    // Not an absolute URL; apply the same rule textually.
+    return /(^|\/)signal$/.test(trimmed) ? trimmed : `${trimmed}${SIGNAL_PATH}`;
+  }
+
+  // A base URL carries no query or hash; drop any that were pasted in.
+  parsed.search = '';
+  parsed.hash = '';
+
+  // Work in whole segments so `/signal-proxy/signal` is not mistaken for a
+  // repeated mount point, while `/signal/signal` is collapsed rather than
+  // producing `/signal/signal/health` → 404.
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  while (
+    segments.length >= 2 &&
+    segments[segments.length - 1] === 'signal' &&
+    segments[segments.length - 2] === 'signal'
+  ) {
+    segments.pop();
+  }
+  if (segments[segments.length - 1] !== 'signal') segments.push('signal');
+
+  parsed.pathname = `/${segments.join('/')}`;
+  return parsed.toString().replace(/\/+$/, '');
+}
+
 export function resolveSignalBaseUrl(inputs: SignalBaseInputs): string {
   /*
    * `?signal=` wins over the compiled-in value.
@@ -89,22 +151,27 @@ export function resolveSignalBaseUrl(inputs: SignalBaseInputs): string {
     const normalised = /^https?:/.test(param)
       ? param
       : `${inputs.protocol ?? 'https:'}//${param.replace(/^\/\//, '')}`;
-    return normalised.replace(/\/$/, '');
+    return normaliseSignalBase(normalised);
   }
 
   const envUrl = inputs.envUrl?.trim();
-  if (envUrl) return envUrl.replace(/\/$/, '');
+  // The bare origin and the explicit `/signal` form both work; see
+  // normaliseSignalBase for why this is accepted rather than rejected.
+  if (envUrl) return normaliseSignalBase(envUrl);
 
   if (inputs.isProd) {
     throw new SignalConfigError(
       'VITE_SIGNAL_URL is not configured. Set it to the public URL of the ' +
         'signalling service (for example https://your-signal-service.onrender.com) ' +
-        'and rebuild — it is compiled in at build time.'
+        'and rebuild — it is compiled in at build time. The value may be the bare ' +
+        'origin or include /signal; both resolve to the same endpoints.'
     );
   }
 
-  if (inputs.origin) return `${inputs.origin}/signal-proxy/signal`;
-  return 'http://localhost:8787';
+  // Development: the Vite proxy strips `/signal-proxy`, leaving `/signal/...`,
+  // so this path already ends in the mount point and normalises to itself.
+  if (inputs.origin) return normaliseSignalBase(`${inputs.origin}/signal-proxy/signal`);
+  return normaliseSignalBase('http://localhost:8787');
 }
 
 /** Resolve the signalling HTTP base URL (no trailing slash). */
@@ -163,9 +230,14 @@ async function postJson<T>(url: string, body: unknown, headers: Record<string, s
   return parsed as T;
 }
 
+/** Health-check URL. Single definition so the path cannot drift per call site. */
+export function signalHealthUrl(base = signalBaseUrl()): string {
+  return `${base}/health`;
+}
+
 export async function checkSignalHealth(base = signalBaseUrl()): Promise<boolean> {
   try {
-    const res = await fetch(`${base}/health`, { method: 'GET' });
+    const res = await fetch(signalHealthUrl(base), { method: 'GET' });
     return res.ok;
   } catch {
     return false;
@@ -207,7 +279,13 @@ export async function closeCameraSession(sessionId: string, token: string): Prom
 export function signalSocketUrl(
   base = signalBaseUrl()
 ): string {
-  const wsBase = base.replace(/^http/, 'ws');
+  /*
+   * Normalise here too. The server accepts both `/ws` and `/signal/ws`, so this
+   * is not required for correctness today, but it keeps every derived URL in one
+   * shape: a caller that passes a bare origin still lands on the mounted path
+   * instead of silently depending on the alias.
+   */
+  const wsBase = normaliseSignalBase(base).replace(/^http/, 'ws');
   return new URL(`${wsBase}/ws`).toString();
 }
 
