@@ -144,7 +144,7 @@ export class PairingController {
     });
 
     const socket = new SignalSocket(
-      signalSocketUrl(this.opts.sessionId, 'phone', joined.joinTicket),
+      signalSocketUrl(),
       {
         onMessage: (msg) => void this.handleSignal(msg),
         onOpen: () => this.patch({ phase: this.snapshot.cameraLive ? 'waiting' : this.snapshot.phase }),
@@ -158,7 +158,8 @@ export class PairingController {
             this.teardown();
           }
         },
-      }
+      },
+      { role: 'phone', sessionId: this.opts.sessionId, ticket: joined.joinTicket }
     );
     this.socket = socket;
     socket.connect();

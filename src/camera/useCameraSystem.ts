@@ -33,6 +33,7 @@ import {
   closeCameraSession,
   createCameraSession,
   signalBaseUrl,
+  SignalConfigError,
   signalSocketUrl,
   type CreateSessionResult,
 } from './signalClient';
@@ -381,7 +382,9 @@ export function useCameraSystem(
         ...initialPairing,
         status: 'error',
         error:
-          err instanceof Error
+          err instanceof SignalConfigError
+            ? err.message
+            : err instanceof Error
             ? `${err.message} — start it with "npm run signal" (or "npm run dev:signal").`
             : 'Could not create a pairing session.',
       });
@@ -418,7 +421,8 @@ export function useCameraSystem(
 
     const source = new WebRtcCameraSource({
       sessionId: session.sessionId,
-      socketUrl: signalSocketUrl(session.sessionId, 'laptop', session.sessionToken),
+      socketUrl: signalSocketUrl(),
+      socketTicket: session.sessionToken,
       iceServers: session.iceServers,
       onStatus: (s, detail) => {
         if (sourceRef.current !== source) return;

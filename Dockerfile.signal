@@ -1,0 +1,20 @@
+# Minimal image for the BHARAT-AV signalling service (Render / Fly / Railway / VPS).
+#
+# Only the signalling server's runtime dependency is installed; the frontend
+# toolchain is not needed and is deliberately excluded.
+FROM node:22-alpine
+
+WORKDIR /app
+
+# ws is the server's only runtime dependency.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY server/signal-server.mjs ./server/signal-server.mjs
+
+# The server reads PORT first (Render injects it), then SIGNAL_PORT.
+ENV NODE_ENV=production
+EXPOSE 8787
+
+# Render sets PORT; locally the default 8787 applies.
+CMD ["node", "server/signal-server.mjs"]

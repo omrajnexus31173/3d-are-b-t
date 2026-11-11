@@ -45,9 +45,15 @@ const post = (url, body, headers = {}) =>
     body: JSON.stringify(body ?? {}),
   });
 
-function openSocket(sessionId, role, ticket) {
-  const url = `ws://127.0.0.1:${PORT}/ws?sid=${encodeURIComponent(sessionId)}&role=${role}&ticket=${encodeURIComponent(ticket)}`;
-  const ws = new WebSocket(url);
+/**
+ * Opens a socket and authenticates it with the first-frame credential.
+ *
+ * The credential is deliberately NOT in the URL any more: it is sent as the
+ * first frame after `open`, exactly as the browser client does.
+ */
+function openSocket(sessionId, role, ticket, opts = {}) {
+  const url = `ws://127.0.0.1:${PORT}/ws`;
+  const ws = new WebSocket(url, opts.wsOptions);
   const messages = [];
   ws.on('error', () => {
     /* close code carries the failure reason */
@@ -63,6 +69,11 @@ function openSocket(sessionId, role, ticket) {
       }
     }
   });
+  if (!opts.skipAuth) {
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ type: 'auth', sessionId, role, ticket }));
+    });
+  }
   return {
     ws,
     messages,
@@ -93,7 +104,18 @@ function openSocket(sessionId, role, ticket) {
 
 beforeAll(async () => {
   child = spawn(process.execPath, [path.join(ROOT, 'server', 'signal-server.mjs')], {
-    env: { ...process.env, SIGNAL_PORT: String(PORT), SIGNAL_TTL_MS: '60000' },
+    env: {
+      ...process.env,
+      SIGNAL_PORT: String(PORT),
+      SIGNAL_TTL_MS: '60000',
+      /*
+       * The suite opens many sockets from 127.0.0.1 within a minute, which would
+       * legitimately trip the per-IP connection limit. Raised here so the
+       * functional tests are not throttled; rate limiting itself is verified by
+       * its own test against a separate server instance with a low limit.
+       */
+      SIGNAL_WS_CONN_LIMIT: '1000',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await waitForReady(child);
