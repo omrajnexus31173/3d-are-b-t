@@ -22,6 +22,11 @@ import { observeVideoReady } from './videoReady';
 export interface WebRtcSourceOptions {
   sessionId: string;
   socketUrl: string;
+  /**
+   * Credential presented as the first frame after the socket opens. It is not
+   * part of `socketUrl` because query strings leak into proxy access logs.
+   */
+  socketTicket: string;
   iceServers: IceServerConfig[];
   onStatus: (status: CameraStatus, detail?: string) => void;
   onError: (error: CameraError) => void;
@@ -103,7 +108,9 @@ export class WebRtcCameraSource implements FrameSource {
         reject(new Error(err.message));
       };
 
-      this.socket = new SignalSocket(this.opts.socketUrl, {
+      this.socket = new SignalSocket(
+        this.opts.socketUrl,
+        {
         onOpen: () => {
           // The laptop drives negotiation: send the offer as soon as the socket
           // is authorised, whether or not the phone is connected yet.
@@ -130,7 +137,9 @@ export class WebRtcCameraSource implements FrameSource {
             });
           }
         },
-      });
+        },
+        { role: 'laptop', sessionId: this.opts.sessionId, ticket: this.opts.socketTicket }
+      );
 
       this.socket.connect();
 

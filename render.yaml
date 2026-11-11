@@ -1,0 +1,62 @@
+# Render blueprint for the BHARAT-AV signalling service.
+#
+# The signalling server MUST run as a separate, always-on Node process. It cannot
+# run on Vercel:
+#   - pairing sessions live in an in-process Map, so two instances (or two
+#     serverless invocations) would not see each other's tokens
+#   - it needs long-lived WebSockets, which static/serverless hosting does not
+#     upgrade
+#
+# Deliberately pinned to a single instance for that reason.
+#
+# Deploy:  Render Dashboard -> New -> Blueprint -> point at this repo.
+# Or create the Web Service manually with the same settings.
+
+services:
+  - type: web
+    name: bharat-av-signal
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    # Only the signalling server's runtime dependency is needed; the frontend
+    # toolchain (vite, react, tailwind) is not installed in production.
+    buildCommand: npm ci --omit=dev
+    startCommand: node server/signal-server.mjs
+    healthCheckPath: /signal/health
+    # ONE instance. In-memory sessions require a single process; autoscaling here
+    # would split pairing state across instances and break token redemption.
+    numInstances: 1
+    autoDeploy: true
+    envVars:
+      # Render injects PORT automatically; the server reads it first.
+      - key: NODE_ENV
+        value: production
+      # REQUIRED: the exact frontend origin(s). Comma-separated, no trailing slash.
+      # The server refuses all traffic when this is missing in production.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Set to "true" only because Render terminates TLS in front of the service
+      # and appends the real client address to X-Forwarded-For.
+      - key: TRUST_PROXY
+        value: "true"
+      - key: SIGNAL_TTL_MS
+        value: "600000"
+      - key: SIGNAL_IDLE_MS
+        value: "300000"
+      - key: SIGNAL_MAX_SESSIONS
+        value: "200"
+      - key: SIGNAL_AUTH_TIMEOUT_MS
+        value: "5000"
+      - key: SIGNAL_WS_CONN_LIMIT
+        value: "20"
+      - key: SIGNAL_WS_CONN_WINDOW_MS
+        value: "60000"
+      # TURN is required only for remote/mobile-data connections. Server-side
+      # only: these are never exposed to the frontend bundle.
+      - key: TURN_URL
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false
