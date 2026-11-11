@@ -77,11 +77,22 @@ starts and serves `/signal/health` with production dependencies only.
 | `TURN_USERNAME` | with TURN | — | **Server-side only** |
 | `TURN_CREDENTIAL` | with TURN | — | **Server-side only** |
 
+> **The base URL contract.** Every request appends a route to the base
+> (`${base}/health`, `${base}/session`, `${base}/ws`), so the resolved base
+> always ends in `/signal`. `normaliseSignalBase()` enforces this once, at
+> resolution time, which is why the environment variable can be either form.
+>
+> ```text
+> VITE_SIGNAL_URL=https://svc.onrender.com        -> https://svc.onrender.com/signal/health
+> VITE_SIGNAL_URL=https://svc.onrender.com/signal -> https://svc.onrender.com/signal/health
+> VITE_SIGNAL_URL=https://svc.onrender.com/signal/signal -> same (collapsed)
+> ```
+
 ### Frontend (Vercel)
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `VITE_SIGNAL_URL` | **yes** | Public URL of the signalling service, e.g. `https://bharat-av-signal.onrender.com` |
+| `VITE_SIGNAL_URL` | **yes** | Public URL of the signalling service, e.g. `https://bharat-av-signal.onrender.com`. Either the bare origin or the origin **with** `/signal` is accepted — both normalise to the same endpoints. |
 
 ---
 
@@ -89,6 +100,9 @@ starts and serves `/signal/health` with production dependencies only.
 
 1. Project → **Settings** → **Environment Variables**
 2. Add `VITE_SIGNAL_URL` = `https://<your-service>.onrender.com`
+   - The bare origin is correct and recommended. Appending `/signal` also works;
+     `/signal/signal` is collapsed automatically. Do **not** append a route such
+     as `/health` or `/session` — the app adds those itself.
    - **No trailing slash.**
    - Scope: **Production** (add Preview too if you test pairing there — but then
      that origin must also be in `ALLOWED_ORIGINS`)
@@ -181,6 +195,7 @@ created — they never appear in the frontend bundle.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Panel: "VITE_SIGNAL_URL is not configured…" | Variable missing at build time | Set it on Vercel, **redeploy** |
+| DevTools shows `…/health` → **404** while `…/signal/health` → 200 | The base URL lacked the `/signal` mount point | Fixed in the client: values are normalised, so a bare origin now resolves to `/signal/*`. If you still see `/health`, the deployment predates the fix — rebuild |
 | Health returns `503 origin_config_missing` | `ALLOWED_ORIGINS` unset in production | Set it on Render |
 | Browser console: CORS error, no `Access-Control-Allow-Origin` | Frontend origin not in `ALLOWED_ORIGINS` | Add exact origin (no trailing slash) |
 | Socket closes with `4401` | Not authenticated within 5 s | Check clock/subnet reachability; usually a network path issue |

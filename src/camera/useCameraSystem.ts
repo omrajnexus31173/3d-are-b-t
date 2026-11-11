@@ -34,6 +34,7 @@ import {
   createCameraSession,
   signalBaseUrl,
   SignalConfigError,
+  signalHealthUrl,
   signalSocketUrl,
   type CreateSessionResult,
 } from './signalClient';
@@ -561,7 +562,8 @@ export function useCameraSystem(
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`${signalBaseUrl()}/health`);
+        // Route through the shared helper so the mount path is defined once.
+        const res = await fetch(signalHealthUrl());
         if (!cancelled) setSignalAvailable(res.ok);
       } catch {
         if (!cancelled) setSignalAvailable(false);
