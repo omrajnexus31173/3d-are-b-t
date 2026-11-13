@@ -13,7 +13,7 @@
  */
 import type { FrameSource } from '../camera/types';
 import { IouTracker, type Track } from './tracker';
-import { detectionDebugEnabled } from './diagnostics';
+import { detectionDebugEnabled, logStageCounts } from './diagnostics';
 import { mapLabelToVisionClass, COCO_LABELS } from './detector';
 import { assessImageRisk, estimateDistance, type CameraCalibration } from './distance';
 import type {
@@ -641,7 +641,15 @@ export class DetectionEngine {
       this.inferenceTimestamps.push(Date.now());
       this.trimWindow(this.inferenceTimestamps);
 
-      const frame = this.buildFrame(msg.detections, msg.frameWidth, msg.frameHeight, msg.timestampMs, latency, msg.inferenceMs);
+      const frame = this.buildFrame(
+        msg.detections,
+        msg.frameWidth,
+        msg.frameHeight,
+        msg.timestampMs,
+        latency,
+        msg.inferenceMs,
+        msg.stages
+      );
       this.lastFrame = frame;
       this.listeners.onFrame?.(frame);
       this.listeners.onStatus?.(this.stats);
@@ -665,7 +673,8 @@ export class DetectionEngine {
     frameHeight: number,
     timestamp: number,
     latency: number,
-    pureInferenceMs: number
+    pureInferenceMs: number,
+    stages?: { raw: number; afterThreshold: number; afterPadding: number }
   ): DetectionFrame {
     const sourceKind: CameraSourceKind = this.source?.kind ?? 'webcam';
     const sourceId = this.source?.id ?? 'unknown';
@@ -699,6 +708,12 @@ export class DetectionEngine {
       }));
     }
     this.lastTracks = tracks;
+    /*
+     * `tracks` is what will be drawn; `getTracks()` is everything retained for
+     * identity. Printing both makes the difference visible: any gap between them
+     * is exactly the set of stale boxes the tracker fix stopped painting.
+     */
+    const retained = this.tracker.getTracks().length;
 
     const classCounts = new Map<VisionClassId, number>();
     for (const t of tracks) {
@@ -747,6 +762,22 @@ export class DetectionEngine {
       .slice(0, Math.max(1, this.detectionConfig.maxDetections));
 
     this.stats.detectionCount = detections.length;
+
+    if (stages) {
+      logStageCounts(
+        this.modelStatus.family === 'dfine' ? 'dfine' : 'yolo',
+        {
+          raw: stages.raw,
+          afterThreshold: stages.afterThreshold,
+          afterPadding: stages.afterPadding,
+          tracked: retained,
+          rendered: detections.length,
+        },
+        { name: this.modelStatus.name, provider: this.modelStatus.executionProvider ?? null },
+        this.detectionConfig.confidence,
+        detectionDebugEnabled()
+      );
+    }
     /*
      * Measured over the last 15 s. `captureFps` is the rate at which frames were
      * *attempted* (including those dropped by back-pressure) and `inferenceFps`

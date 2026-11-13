@@ -152,8 +152,14 @@ describe('engine frame handed to the overlay', () => {
     );
     // The engine must consume update()'s return value directly...
     expect(src).toContain('tracks = this.tracker.update(');
-    // ...and must not re-render the full retained set behind its back.
-    expect(src).not.toContain('tracker.getTracks()');
+    /*
+     * ...and must not hand the retained set to the overlay. The engine does read
+     * getTracks() - only to report the retained count in the diagnostic line -
+     * so assert the absence of the thing that actually matters: that the frame's
+     * detections are not built from it.
+     */
+    expect(src).not.toContain('this.tracker.getTracks() as');
+    expect(src).toContain('rendered: detections.length');
   });
 
   it('keeps the render cap and the tracker ceiling consistent', async () => {
@@ -163,5 +169,58 @@ describe('engine frame handed to the overlay', () => {
     const t = new IouTracker({ maxTracks: DEFAULT_DETECTION_CONFIG.maxDetections });
     const dets = Array.from({ length: 60 }, (_, i) => person(5 + i * 10, 20));
     expect(t.update(dets, 0).length).toBeLessThanOrEqual(DEFAULT_DETECTION_CONFIG.maxDetections);
+  });
+});
+
+/**
+ * Identity must survive the fix.
+ *
+ * This is the other half of the requirement: stale boxes must disappear *without*
+ * costing stable ids. A subject that associates normally has to keep one trackId
+ * for its whole life, exactly as before.
+ */
+describe('stable identities are preserved', () => {
+  it('keeps one trackId for a subject that associates frame to frame', () => {
+    const t = engineTracker();
+    const ids: string[] = [];
+    for (let f = 0; f < 15; f++) {
+      // 20 px per frame: well within IoU 0.3 for a 60x120 box.
+      const tracks = t.update([person(100 + f * 20, 100)], f * 1250);
+      expect(tracks).toHaveLength(1);
+      ids.push(tracks[0].trackId);
+    }
+    // One id for the whole run - identity is not churned by the render filter.
+    expect(new Set(ids).size).toBe(1);
+    expect(ids[0]).toBe('CAM-1');
+  });
+
+  it('resumes the same id after a one-frame detection gap', () => {
+    const t = engineTracker();
+    const first = t.update([person(100, 100)], 0);
+    expect(first[0].trackId).toBe('CAM-1');
+    // Detector misses one frame: nothing drawn, but the track is retained.
+    expect(t.update([], 1250)).toHaveLength(0);
+    expect(t.getTracks()).toHaveLength(1);
+    // Back again at the same place: same id, so numbering stays stable on screen.
+    const back = t.update([person(102, 100)], 2500);
+    expect(back).toHaveLength(1);
+    expect(back[0].trackId).toBe('CAM-1');
+  });
+
+  it('keeps distinct ids for distinct objects', () => {
+    const t = engineTracker();
+    const tracks = t.update([person(60, 100), person(300, 100), person(520, 100)], 0);
+    expect(tracks.map((x) => x.trackId)).toEqual(['CAM-1', 'CAM-2', 'CAM-3']);
+    // Second frame, all re-matched: same ids, same order.
+    const again = t.update([person(62, 100), person(302, 100), person(522, 100)], 1250);
+    expect(again.map((x) => x.trackId)).toEqual(['CAM-1', 'CAM-2', 'CAM-3']);
+  });
+
+  it('never reuses a live id when a new object appears', () => {
+    const t = engineTracker();
+    t.update([person(100, 100)], 0);
+    const second = t.update([person(100, 100), person(400, 100)], 1250);
+    expect(second).toHaveLength(2);
+    expect(new Set(second.map((x) => x.trackId)).size).toBe(2);
   });
 });

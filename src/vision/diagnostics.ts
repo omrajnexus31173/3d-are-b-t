@@ -34,6 +34,32 @@ export interface DetectionStatsSummary {
   keptScoreMax: number;
   /** Threshold the above was measured against. */
   threshold: number;
+  /**
+   * Rows that survived padding rejection AND unletterboxing, i.e. the boxes
+   * actually sent to the main thread. Present on the worker's own report; the
+   * main thread fills in the two tracker numbers below when it logs.
+   */
+  afterPadding?: number;
+}
+
+/**
+ * The full stage-by-stage count from graph output to painted box.
+ *
+ * Deliberately ordered as the pipeline runs, because the whole point is to find
+ * *which* stage changes the number. `rendered` is the only one the operator
+ * actually sees on screen.
+ */
+export interface StageCounts {
+  /** Rows the graph emitted (300 for D-FINE). */
+  raw: number;
+  /** Rows above the confidence threshold with a valid, non-degenerate box. */
+  afterThreshold: number;
+  /** ...minus rows lying wholly in the letterbox filler. */
+  afterPadding: number;
+  /** Live tracks after IoU association (identity, includes stale). */
+  tracked: number;
+  /** Tracks drawn this frame; equals what DetectionOverlay maps over. */
+  rendered: number;
 }
 
 export function emptyDetectionStats(threshold = 0): DetectionStatsSummary {
@@ -110,6 +136,27 @@ export function formatDiagnostic(d: DetectionDiagnostic): string {
 }
 
 /**
+ * Format the stage-by-stage count as one line.
+ *
+ * Printed by the engine once per frame, after tracking, so a single line covers
+ * the whole path and any stage that changes the count is immediately visible.
+ */
+export function formatStageCounts(
+  detector: DetectionDiagnostic['detector'],
+  stages: StageCounts,
+  model: { name: string; provider?: string | null },
+  threshold: number
+): string {
+  return (
+    `[bharat-av][stages] detector=${detector} model=${model.name}` +
+    (model.provider ? ` provider=${model.provider}` : '') +
+    ` thr=${threshold} raw=${stages.raw} -> afterThreshold=${stages.afterThreshold}` +
+    ` -> afterPadding=${stages.afterPadding} -> tracked=${stages.tracked}` +
+    ` -> rendered=${stages.rendered}`
+  );
+}
+
+/**
  * Emit a diagnostic line when explicitly enabled.
  *
  * Opt-in via `VITE_DETECTION_DEBUG=1` (build-time) or
@@ -135,4 +182,16 @@ export function logDiagnostic(d: DetectionDiagnostic, override?: boolean): void 
   if (!detectionDebugEnabled(override)) return;
   // eslint-disable-next-line no-console
   console.info(formatDiagnostic(d));
+}
+
+export function logStageCounts(
+  detector: DetectionDiagnostic['detector'],
+  stages: StageCounts,
+  model: { name: string; provider?: string | null },
+  threshold: number,
+  override?: boolean
+): void {
+  if (!detectionDebugEnabled(override)) return;
+  // eslint-disable-next-line no-console
+  console.info(formatStageCounts(detector, stages, model, threshold));
 }

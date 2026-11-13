@@ -101,6 +101,12 @@ export type WorkerResponse =
       frameWidth: number;
       frameHeight: number;
       timestampMs: number;
+      /**
+       * Stage counts from the decode path. Carried to the main thread so the
+       * engine can print one line covering graph output -> painted box; the
+       * worker cannot see the tracker or the overlay.
+       */
+      stages?: { raw: number; afterThreshold: number; afterPadding: number };
     }
   | { type: 'reset_done'; requestId: number };
 
@@ -414,10 +420,17 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
         scores: tensors.scores.dims,
       }, msg.frameWidth, msg.frameHeight, msg.debug);
 
+      const stages = {
+        raw: counts.raw,
+        afterThreshold: counts.kept,
+        afterPadding: inContent.length,
+      };
+
       post({
         type: 'result',
         requestId: msg.requestId,
         detections,
+        stages,
         inferenceMs: tPost - tInfer,
         preprocessMs: tInfer - tPre,
         postprocessMs: performance.now() - tPost,
