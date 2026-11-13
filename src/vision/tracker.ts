@@ -54,6 +54,26 @@ export interface TrackerOptions {
    * (lowest confidence EMA) unverified tracks are dropped first.
    */
   maxTracks?: number;
+  /**
+   * How many recent, *matched* detections are drawn.
+   *
+   * This is deliberately not `maxMissed`. `maxMissed` is about identity: how long
+   * a track keeps the same id while briefly unseen, which matters for stable
+   * numbering. Drawing is a different question - a box drawn where the detector
+   * currently sees nothing is simply a box in the wrong place.
+   *
+   * The trap is the interaction with inference rate. At the ~0.8 FPS measured on
+   * device, `maxMissed` 10 keeps every ghost alive for 12.5 seconds. A walking
+   * person crosses the frame in less than that, so IoU association fails on
+   * consecutive frames, every frame spawns a new track, and the previous ones
+   * linger. The overlay then shows one person as a trail of a dozen boxes.
+   * Offline the same model reports ~12 detections per image, so the model is not
+   * the source of the extra boxes.
+   *
+   * With a small value only the most recent detection is drawn; tracks that were
+   * missed are retained for numbering but not rendered.
+   */
+  maxMissedRendered?: number;
 }
 
 const PREFIX = 'CAM';
@@ -65,6 +85,7 @@ export class IouTracker {
   private readonly maxMissed: number;
   private readonly minHits: number;
   private readonly maxTracks: number;
+  private readonly maxMissedRendered: number;
   private readonly prefix: string;
 
   constructor(options: TrackerOptions = {}, prefix = PREFIX) {
@@ -74,6 +95,14 @@ export class IouTracker {
     // 64 is comfortably above a real traffic scene while still bounding the
     // overlay; the previous behaviour was effectively unlimited.
     this.maxTracks = options.maxTracks ?? 64;
+    /*
+     * 1 = draw only tracks matched in the latest inference frame.
+     *
+     * Anything higher re-introduces the ghost trail whenever the inference rate
+     * drops: the number of ghost frames is exactly this value, and the wall-clock
+     * lifetime is this value divided by the inference rate.
+     */
+    this.maxMissedRendered = options.maxMissedRendered ?? 1;
     this.prefix = prefix;
   }
 
@@ -162,7 +191,23 @@ export class IouTracker {
 
     if (this.tracks.size > this.maxTracks) this.evictWeakest();
 
-    return this.getTracks();
+    return this.getRenderableTracks();
+  }
+
+  /**
+   * Tracks that correspond to something the detector saw recently.
+   *
+   * `update()` returns these rather than every live track, because the caller
+   * feeds them straight to the overlay. A track missed once is kept for id
+   * continuity but no longer drawn: its box would be a stale position.
+   */
+  getRenderableTracks(): Track[] {
+    return this.getTracks().filter((t) => t.missed < this.maxMissedRendered);
+  }
+
+  /** Live tracks that were missed in the latest frame (retained, not drawn). */
+  getStale(): Track[] {
+    return this.getTracks().filter((t) => t.missed >= this.maxMissedRendered);
   }
 
   /**
