@@ -114,6 +114,8 @@ export interface CameraSystemState {
   resolution: { width: number; height: number } | null;
   /** Modes available for the selected device (device-reported when possible). */
   resolutionOptions: CameraResolutionOption[];
+  /** Detector the operator selected. YOLO11n is the default. */
+  preferredDetector: 'yolo11n' | 'dfine-n';
 }
 
 export interface CameraSystemActions {
@@ -131,6 +133,11 @@ export interface CameraSystemActions {
   setResolution: (next: { width: number; height: number } | null) => void;
   setConfig: (patch: Partial<DetectionConfig>) => void;
   setCalibration: (c: CameraCalibration | null) => void;
+  /**
+   * Select YOLO11n or D-FINE-N and (re)load it. Returns the resulting status so
+   * the caller can react to a D-FINE failure that fell back to YOLO11n.
+   */
+  selectDetector: (id: 'yolo11n' | 'dfine-n') => Promise<ModelStatus>;
   dismissError: () => void;
 }
 
@@ -163,6 +170,7 @@ export function useCameraSystem(
   const [sourceKind, setSourceKind] = useState<CameraSourceKind | null>(null);
   const [config, setConfigState] = useState<DetectionConfig>(DEFAULT_DETECTION_CONFIG);
   const [calibration, setCalibrationState] = useState<CameraCalibration | null>(null);
+  const [preferredDetector, setPreferredDetectorState] = useState<'yolo11n' | 'dfine-n'>('yolo11n');
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sourceRef = useRef<FrameSource | null>(null);
@@ -171,6 +179,8 @@ export function useCameraSystem(
   const pendingFrame = useRef<DetectionFrame | null>(null);
   const rafRef = useRef<number | null>(null);
   const pairingSessionRef = useRef<CreateSessionResult | null>(null);
+  /** Latest selected device, readable from callbacks without a stale closure. */
+  const selectedDeviceIdRef = useRef<string | null>(null);
 
   // --- engine construction ------------------------------------------------
   if (!engineRef.current) {
@@ -254,6 +264,8 @@ export function useCameraSystem(
   const [resolution, setResolutionState] = useState<{ width: number; height: number } | null>(null);
 
   const selectDevice = useCallback((deviceId: string | null) => {
+    // Mirror into the ref first so an immediate Connect cannot race the state update.
+    selectedDeviceIdRef.current = deviceId;
     setSelectedDeviceId(deviceId);
     // Modes differ per device; never carry a stale choice across devices.
     setResolutionState(null);
@@ -302,10 +314,21 @@ export function useCameraSystem(
     setError(null);
     setStatusDetail('');
 
-    const chosen = devices.find((d) => d.deviceId === selectedDeviceId) ?? null;
+    /*
+     * Read the selection through the ref, not the closure.
+     *
+     * `actions` is a useMemo over these callbacks, and connectLocal is also
+     * invoked directly by the panel. When the device list is refreshed the
+     * component may re-render without this callback being rebuilt in the same
+     * tick, so a closure over `selectedDeviceId` can still hold the previous
+     * camera — connecting the wrong device (or the "Default camera" entry) even
+     * though the dropdown shows another one.
+     */
+    const deviceId = selectedDeviceIdRef.current;
+    const chosen = devices.find((d) => d.deviceId === deviceId) ?? null;
     const source = new LocalCameraSource(
       {
-        deviceId: selectedDeviceId ?? undefined,
+        deviceId: deviceId ?? undefined,
         kind: chosen?.kind,
         label: chosen?.label,
         // Only constrain when the user picked a mode; otherwise let the browser
@@ -346,7 +369,7 @@ export function useCameraSystem(
     } catch (err) {
       setError(cameraErrorFrom(err));
     }
-  }, [refreshDevices, selectedDeviceId, devices, resolution, releaseSource]);
+  }, [refreshDevices, devices, resolution, releaseSource]);
 
   // --- QR / WebRTC pairing ------------------------------------------------
   const pairingInFlight = useRef(false);
@@ -527,6 +550,42 @@ export function useCameraSystem(
     }
   }, [loadModel]);
 
+  /**
+   * Switch the preferred detector and immediately load it.
+   *
+   * Detection is stopped first: swapping the graph underneath a running loop
+   * would score frames with the old session while the panel claims the new one.
+   * The operator presses Start detection again once the new model is ready.
+   */
+  const selectDetector = useCallback(async (id: 'yolo11n' | 'dfine-n') => {
+    const engine = engineRef.current;
+    setPreferredDetectorState(id);
+    if (!engine) return { state: 'error' } as ModelStatus;
+    const changed = engine.setPreferredDetector(id);
+    if (!changed && engine.getModelStatus().state === 'ready') {
+      return engine.getModelStatus();
+    }
+    if (engine.isRunning()) {
+      engine.stop();
+      setDetecting(false);
+    }
+    setModelLoadState('loading');
+    const status = await engine.loadModel('onnxruntime-web');
+    setModelLoadState(status.state === 'ready' ? 'ready' : status.state === 'error' ? 'error' : 'idle');
+    /*
+     * If D-FINE was requested but the engine fell back, say so explicitly rather
+     * than leaving the panel showing a detector the operator did not pick.
+     */
+    if (id === 'dfine-n' && status.state === 'ready' && status.id !== 'dfine-n-coco') {
+      setError({
+        code: 'unknown',
+        message: `D-FINE-N could not be loaded — running ${status.name} instead.`,
+        hint: status.message,
+      });
+    }
+    return status;
+  }, []);
+
   const setResolution = useCallback((next: { width: number; height: number } | null) => {
     setResolutionState(next);
   }, []);
@@ -636,6 +695,7 @@ export function useCameraSystem(
       calibration,
       resolution,
       resolutionOptions: resolutionOptionsFor(devices.find((d) => d.deviceId === selectedDeviceId) ?? null),
+      preferredDetector,
     }),
     [
       mode,
@@ -656,6 +716,7 @@ export function useCameraSystem(
       config,
       calibration,
       resolution,
+      preferredDetector,
     ]
   );
 
@@ -675,6 +736,7 @@ export function useCameraSystem(
       setResolution,
       setConfig,
       setCalibration,
+      selectDetector,
       dismissError: () => setError(null),
     }),
     [
@@ -692,6 +754,7 @@ export function useCameraSystem(
       setResolution,
       setConfig,
       setCalibration,
+      selectDetector,
     ]
   );
 

@@ -10,6 +10,7 @@
  * Messages are plain structured-clone objects; frames are transferred as
  * ImageBitmap to avoid copies.
  */
+import { decodeDFineOutput } from './dfine';
 import { decodeYoloOutput, nonMaxSuppression, unletterboxBox } from './detector';
 
 import type { BoundingBox } from './types';
@@ -100,6 +101,18 @@ interface LoadedOnnx {
   session: import('./onnx').OnnxSession;
   inputSize: number;
   labels: string[];
+  /**
+   * Which ONNX contract this session speaks.
+   *
+   * 'yolo'  - 1 input (images), N outputs, needs decodeYoloOutput + NMS.
+   * 'dfine' - 2 inputs (images + int64 orig_target_sizes), 3 outputs
+   *           (labels, boxes, scores), NMS-free, decoder already in the graph.
+   *
+   * Detected from the session's own input names at load time, so a model can
+   * never be driven through the wrong path just because its registry entry says
+   * 'dfine'. Defaults to 'yolo' so existing behaviour is untouched.
+   */
+  modelFamily: 'yolo' | 'dfine';
 }
 
 interface LoadedTfjs {
@@ -226,13 +239,24 @@ async function handleLoad(msg: Extract<WorkerRequest, { type: 'load' }>) {
           continue;
         }
         const session = await createOnnxSession(buf);
+        const meta = describeSession(session);
+        // Trust the graph, not the registry: a session that wants an int64
+        // second input is a D-FINE-style graph regardless of how it is listed.
+        const modelFamily: 'yolo' | 'dfine' = meta.inputs.includes('orig_target_sizes')
+          ? 'dfine'
+          : 'yolo';
+        if (modelFamily === 'dfine' && meta.inputs.length !== 2) {
+          throw new Error(
+            `D-FINE graph expects 2 inputs, got ${meta.inputs.length}: ${meta.inputs.join(', ')}`
+          );
+        }
         loaded = {
           backend: 'onnxruntime-web',
           session,
           inputSize: msg.inputSize,
           labels: msg.labels,
+          modelFamily,
         };
-        const meta = describeSession(session);
         post({
           type: 'loaded',
           requestId: msg.requestId,
@@ -310,6 +334,67 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
         detections,
         inferenceMs: tPost - tPre,
         preprocessMs: 0,
+        postprocessMs: performance.now() - tPost,
+        frameWidth: msg.frameWidth,
+        frameHeight: msg.frameHeight,
+        timestampMs: msg.timestampMs,
+      });
+      return;
+    }
+
+    // ---- D-FINE path: 2 inputs, 3 outputs, decoder + top-k already in graph ----
+    // Branch on the loaded slot (narrowed) rather than on `loaded` directly so
+    // the closures below do not have to re-widen the union.
+    const onnxLoaded = loaded;
+    if (onnxLoaded.backend === 'onnxruntime-web' && onnxLoaded.modelFamily === 'dfine') {
+      const data = rgbToNchwTensor(pixels, msg.inputSize);
+      const tInfer = performance.now();
+      const { ort, session } = onnxLoaded.session;
+
+      // orig_target_sizes MUST be [[640,640]] - the letterboxed canvas, not the
+      // source frame. The reference implementation reads it from the resized
+      // image, so it is always square; frame-space mapping happens afterwards
+      // via unletterboxBox below.
+      const sizes = new BigInt64Array([BigInt(msg.inputSize), BigInt(msg.inputSize)]);
+      const outputMap = await session.run({
+        images: new ort.Tensor('float32', data, [1, 3, msg.inputSize, msg.inputSize]),
+        orig_target_sizes: new ort.Tensor('int64', sizes, [1, 2]),
+      });
+      const tPost = performance.now();
+
+      const asTensor = (name: string) => {
+        const t = outputMap[name];
+        if (!t) {
+          throw new Error(
+            `D-FINE graph did not return "${name}" (got: ${Object.keys(outputMap).join(', ')})`
+          );
+        }
+        return { dims: Array.from(t.dims), data: t.data as ArrayLike<number> };
+      };
+
+      const decoded = decodeDFineOutput(
+        {
+          labels: asTensor('labels'),
+          boxes: asTensor('boxes'),
+          scores: asTensor('scores'),
+        },
+        { threshold: msg.threshold, labels: onnxLoaded.labels, maxDetections: msg.maxDetections }
+      );
+
+      // No NMS: the graph's top-k already yields one row per query.
+      const detections = decoded.map((d) => ({
+        box: unletterboxBox(d.box, geometry, msg.frameWidth, msg.frameHeight),
+        label: onnxLoaded.labels[d.classIndex] ?? `class ${d.classIndex}`,
+        classIndex: d.classIndex,
+        confidence: d.confidence,
+      }));
+
+      post({
+        type: 'result',
+        requestId: msg.requestId,
+        detections,
+        inferenceMs: tPost - tInfer,
+        preprocessMs: tInfer - tPre,
         postprocessMs: performance.now() - tPost,
         frameWidth: msg.frameWidth,
         frameHeight: msg.frameHeight,

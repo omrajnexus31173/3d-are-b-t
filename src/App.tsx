@@ -309,6 +309,15 @@ export function App() {
     setModelStatus(status);
   };
 
+  /*
+   * Switching detector loads the graph inside the engine, so the parent only has
+   * to mirror the returned status. Calling loadModel() again here would download
+   * and compile the same 15 MB asset twice.
+   */
+  const handleSelectDetector = (id: 'yolo11n' | 'dfine-n') => {
+    void cameraActions.selectDetector(id).then(setModelStatus);
+  };
+
   const handleUploadPothole = async (file: File) => {
     // Pothole weights are user supplied. We load them through the ONNX backend
     // and report honestly when that runtime is unavailable in this browser —
@@ -453,6 +462,7 @@ export function App() {
                   videoRef={videoRef}
                   modelStatus={modelStatus ?? engineRef.current?.getModelStatus() ?? null}
                   onLoadModel={() => void handleLoadModel()}
+                  onSelectDetector={handleSelectDetector}
                   onUploadPothole={handleUploadPothole}
                 />
               </div>
