@@ -152,8 +152,20 @@ export class DetectionEngine {
     return this.preferredDetector;
   }
 
-  setPreferredDetector(next: 'yolo11n' | 'dfine-n'): void {
+  /**
+   * Choose the preferred detector.
+   *
+   * Switching does NOT hot-swap an already-loaded graph by itself: the caller
+   * must call loadModel() afterwards, which is what the UI does. The loaded
+   * model stays YOLO11n until then, so `activeDef` and `modelStatus` continue to
+   * describe reality instead of advertising a detector that is not running.
+   * Returns true when the preference actually changed.
+   */
+  setPreferredDetector(next: 'yolo11n' | 'dfine-n'): boolean {
+    const changed = this.preferredDetector !== next;
     this.preferredDetector = next;
+    if (changed) this.lastDFineError = null;
+    return changed;
   }
 
   getConfig(): DetectionConfig {
