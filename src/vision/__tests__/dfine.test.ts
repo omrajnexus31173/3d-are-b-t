@@ -237,3 +237,35 @@ describe('D-FINE decode: int64 handling', () => {
     expect(b[0].classIndex).toBe(2);
   });
 });
+
+describe('D-FINE decode: letterbox-padding rejection', () => {
+  it('drops boxes that live wholly in the padding band', async () => {
+    const { filterToContentRegion } = await import('../dfine');
+    // 1280x720 into 640 => scale 0.5, padY 140, content 640x360.
+    const geo = { padX: 0, padY: 140, contentWidth: 640, contentHeight: 360 };
+    const dets = [
+      { box: { x: 100, y: 10, width: 60, height: 50 } },   // inside top filler
+      { box: { x: 100, y: 560, width: 60, height: 50 } },  // inside bottom filler
+      { box: { x: 100, y: 230, width: 60, height: 50 } },  // real content
+      { box: { x: 100, y: 120, width: 60, height: 60 } },  // straddles the edge -> kept
+    ];
+    const { kept, droppedInPadding } = filterToContentRegion(dets, geo);
+    expect(droppedInPadding).toBe(2);
+    expect(kept).toHaveLength(2);
+  });
+
+  it('keeps everything when the frame is already square (no padding)', async () => {
+    const { filterToContentRegion } = await import('../dfine');
+    const geo = { padX: 0, padY: 0, contentWidth: 640, contentHeight: 640 };
+    const dets = [{ box: { x: 1, y: 1, width: 10, height: 10 } }];
+    expect(filterToContentRegion(dets, geo).kept).toHaveLength(1);
+  });
+
+  it('drops a side-band box for a portrait frame', async () => {
+    const { filterToContentRegion } = await import('../dfine');
+    // 480x640 into 640 => scale 1, padX 80, content 480x640.
+    const geo = { padX: 80, padY: 0, contentWidth: 480, contentHeight: 640 };
+    const dets = [{ box: { x: 5, y: 100, width: 40, height: 40 } }];
+    expect(filterToContentRegion(dets, geo).droppedInPadding).toBe(1);
+  });
+});

@@ -24,6 +24,8 @@ export interface DetectionStatsSummary {
   degenerate: number;
   /** Rows dropped for a class index outside the label table. */
   badClass: number;
+  /** Rows dropped because they lay wholly inside the letterbox filler. */
+  inPadding?: number;
   /** Observed score range over ALL raw rows, 0 when empty. */
   scoreMin: number;
   scoreMax: number;
@@ -97,7 +99,9 @@ export function formatDiagnostic(d: DetectionDiagnostic): string {
   return (
     `[bharat-av][${d.detector}] raw=${c.raw} kept=${c.kept} ` +
     `dropped(thr<=${c.threshold}:${c.belowThreshold} invalid:${c.invalid} ` +
-    `degenerate:${c.degenerate} badClass:${c.badClass}) ` +
+    `degenerate:${c.degenerate} badClass:${c.badClass}` +
+    (c.inPadding ? ` inPadding:${c.inPadding}` : '') +
+    `) ` +
     `score=${c.scoreMin.toFixed(2)}..${c.scoreMax.toFixed(2)} keptScore=${keptRange} ` +
     `frame=${d.frame.width}x${d.frame.height}` +
     (shapes ? ` shapes=${shapes}` : '') +

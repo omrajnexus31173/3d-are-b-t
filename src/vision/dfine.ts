@@ -234,3 +234,46 @@ export function decodeDFineOutput(
 ): DFineCanvasDetection[] {
   return decodeDFineWithStats(raw, opts).detections;
 }
+
+/**
+ * Drop detections that fall entirely inside the letterbox padding.
+ *
+ * The graph sees a square canvas whose top/bottom (or left/right) bands are
+ * pure black filler. A detection whose box lies wholly within that filler cannot
+ * correspond to an object in the photograph: there is nothing there to see.
+ *
+ * This matters because `unletterboxBox` clamps to the frame, so such a box does
+ * not disappear - it collapses into a thin sliver pinned to the frame edge.
+ * Several of those per frame is exactly how the overlay ends up showing a row of
+ * boxes along an edge that belong to nothing.
+ *
+ * Partial overlap is KEPT: an object at the very edge of the picture legitimately
+ * extends into the band after letterboxing.
+ */
+export function filterToContentRegion<T extends { box: BoundingBox }>(
+  detections: T[],
+  geo: { padX: number; padY: number; contentWidth: number; contentHeight: number }
+): { kept: T[]; droppedInPadding: number } {
+  const left = geo.padX;
+  const top = geo.padY;
+  const right = geo.padX + geo.contentWidth;
+  const bottom = geo.padY + geo.contentHeight;
+
+  const kept: T[] = [];
+  let droppedInPadding = 0;
+  for (const d of detections) {
+    const x1 = d.box.x;
+    const y1 = d.box.y;
+    const x2 = d.box.x + d.box.width;
+    const y2 = d.box.y + d.box.height;
+    // Overlap with the content rectangle; <= 0 means fully in the filler.
+    const overlapW = Math.min(x2, right) - Math.max(x1, left);
+    const overlapH = Math.min(y2, bottom) - Math.max(y1, top);
+    if (overlapW <= 0 || overlapH <= 0) {
+      droppedInPadding += 1;
+      continue;
+    }
+    kept.push(d);
+  }
+  return { kept, droppedInPadding };
+}
