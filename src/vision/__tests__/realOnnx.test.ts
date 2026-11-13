@@ -93,3 +93,72 @@ describe.skipIf(!existsSync(MODEL))('real ONNX Runtime session -> decoder', () =
     expect(fixed.counts.kept).toBe(2);
   });
 });
+
+/**
+ * End-to-end: real ORT session -> decode -> padding filter -> letterbox reversal
+ * -> tracker, i.e. every stage between the graph and the overlay.
+ *
+ * The one non-synthetic thing this can still prove without the 15 MB artifact is
+ * that the *pipeline* neither invents boxes nor duplicates them. The numbers the
+ * overlay would receive are asserted to equal the numbers the decoder produced.
+ */
+describe('pipeline: decoder -> worker filters -> tracker -> overlay input', () => {
+  const FRAME = { width: 640, height: 480 };
+  // 640x480 into 640: scale 1, padY 80, content 640x320.
+  const geo = { padX: 0, padY: 80, contentWidth: 640, contentHeight: 320 };
+
+  it('carries decoder output through to the overlay without duplicating it', async () => {
+    const { filterToContentRegion } = await import('../dfine');
+    const { unletterboxBox } = await import('../detector');
+    const { IouTracker } = await import('../tracker');
+    const { mapLabelToVisionClass } = await import('../detector');
+    const ort = await import('onnxruntime-web');
+    const bytes = new Uint8Array(readFileSync(MODEL));
+    const session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+    const out = await session.run({
+      images: new ort.Tensor('float32', new Float32Array(3 * 640 * 640), [1, 3, 640, 640]),
+      orig_target_sizes: new ort.Tensor('int64', BigInt64Array.from([BigInt(640), BigInt(640)]), [1, 2]),
+    });
+
+    const { detections, counts } = decodeDFineWithStats(
+      {
+        labels: { dims: out.labels.dims as unknown as readonly number[], data: out.labels.data as ArrayLike<unknown> },
+        boxes: { dims: out.boxes.dims as unknown as readonly number[], data: out.boxes.data as ArrayLike<number> },
+        scores: { dims: out.scores.dims as unknown as readonly number[], data: out.scores.data as ArrayLike<number> },
+      },
+      { threshold: 0.5, labels: LABELS, maxDetections: 40 }
+    );
+    expect(counts.kept).toBe(2);
+
+    // Worker stage: padding rejection (boxes at canvas y 120..300 and 200..420
+    // both overlap the 80..400 content band, so nothing is dropped here).
+    const { kept, droppedInPadding } = filterToContentRegion(detections, geo);
+    expect(droppedInPadding).toBe(0);
+    expect(kept).toHaveLength(counts.kept);
+
+    // Worker stage: letterbox reversal into frame space.
+    const inFrame = kept.map((d) => ({
+      box: unletterboxBox(d.box, { ...geo, frameWidth: FRAME.width, frameHeight: FRAME.height } as never,
+        FRAME.width, FRAME.height),
+      classId: mapLabelToVisionClass(LABELS[d.classIndex]),
+      modelLabel: LABELS[d.classIndex],
+      confidence: d.confidence,
+    }));
+
+    // Geometry round-trip: canvas (100,120) 120x180, padY 80, scale 1 -> (100,40).
+    expect(inFrame[0].box).toEqual({ x: 100, y: 40, width: 120, height: 180 });
+    expect(inFrame[1].box).toEqual({ x: 400, y: 120, width: 70, height: 220 });
+
+    // Tracker stage: first frame must render exactly what was decoded.
+    const tracker = new IouTracker({ maxTracks: 40 });
+    const rendered = tracker.update(inFrame, 1000);
+    expect(rendered).toHaveLength(2);
+    expect(rendered.map((t) => t.box)).toEqual(inFrame.map((d) => d.box));
+
+    // Second frame with the identical detections must still render 2, not 4.
+    expect(tracker.update(inFrame, 2250)).toHaveLength(2);
+
+    // Third frame with nothing detected must render 0, not the 2 ghosts.
+    expect(tracker.update([], 3500)).toHaveLength(0);
+  });
+});

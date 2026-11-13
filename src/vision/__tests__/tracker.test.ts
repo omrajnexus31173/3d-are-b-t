@@ -70,7 +70,14 @@ describe('IouTracker', () => {
       [{ box: box(10, 10), classId: 'pedestrian', modelLabel: 'person', confidence: 0.8 }],
       1100
     );
-    expect(tracks).toHaveLength(2);
+    /*
+     * Association: the pedestrian did not absorb the car track - both are live.
+     * Rendering: only the pedestrian was detected this frame, so only it is
+     * drawn; the car is retained for id continuity but not rendered.
+     */
+    expect(tracker.getTracks()).toHaveLength(2);
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0].classId).toBe('pedestrian');
   });
 
   it('resets cleanly (no id reuse collisions)', () => {

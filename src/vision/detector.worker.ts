@@ -10,7 +10,7 @@
  * Messages are plain structured-clone objects; frames are transferred as
  * ImageBitmap to avoid copies.
  */
-import { decodeDFineWithStats } from './dfine';
+import { decodeDFineWithStats, filterToContentRegion } from './dfine';
 import { decodeYoloOutput, nonMaxSuppression, unletterboxBox } from './detector';
 import {
   emptyDetectionStats,
@@ -101,6 +101,12 @@ export type WorkerResponse =
       frameWidth: number;
       frameHeight: number;
       timestampMs: number;
+      /**
+       * Stage counts from the decode path. Carried to the main thread so the
+       * engine can print one line covering graph output -> painted box; the
+       * worker cannot see the tracker or the overlay.
+       */
+      stages?: { raw: number; afterThreshold: number; afterPadding: number };
     }
   | { type: 'reset_done'; requestId: number };
 
@@ -391,8 +397,17 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
         maxDetections: msg.maxDetections,
       });
 
-      // No NMS by default: the graph's top-k already yields one row per query.
-      const detections = decoded.map((d) => ({
+      /*
+       * Drop boxes that live entirely in the letterbox filler BEFORE mapping to
+       * frame space. Done here rather than after, because unletterboxBox clamps
+       * to the frame and a padding-only box would otherwise survive as a sliver
+       * pinned to the picture edge.
+       *
+       * No NMS by default: the graph's top-k already yields one row per query.
+       */
+      const { kept: inContent, droppedInPadding } = filterToContentRegion(decoded, geometry);
+      counts.inPadding = droppedInPadding;
+      const detections = inContent.map((d) => ({
         box: unletterboxBox(d.box, geometry, msg.frameWidth, msg.frameHeight),
         label: onnxLoaded.labels[d.classIndex] ?? `class ${d.classIndex}`,
         classIndex: d.classIndex,
@@ -405,10 +420,17 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
         scores: tensors.scores.dims,
       }, msg.frameWidth, msg.frameHeight, msg.debug);
 
+      const stages = {
+        raw: counts.raw,
+        afterThreshold: counts.kept,
+        afterPadding: inContent.length,
+      };
+
       post({
         type: 'result',
         requestId: msg.requestId,
         detections,
+        stages,
         inferenceMs: tPost - tInfer,
         preprocessMs: tInfer - tPre,
         postprocessMs: performance.now() - tPost,
