@@ -18,6 +18,7 @@ import { useCameraSystem } from './camera/useCameraSystem';
 import { CameraDetectionPanel } from './components/camera/CameraDetectionPanel';
 import { cameraDetectionsToTrackedObjects, summarisePerception } from './vision/hybrid';
 import type { ModelStatus } from './vision/types';
+import type { DetectorId } from './vision/models';
 import {
   LayerVisibility,
   ScenarioId,
@@ -314,7 +315,7 @@ export function App() {
    * to mirror the returned status. Calling loadModel() again here would download
    * and compile the same 15 MB asset twice.
    */
-  const handleSelectDetector = (id: 'yolo11n' | 'dfine-n') => {
+  const handleSelectDetector = (id: DetectorId) => {
     void cameraActions.selectDetector(id).then(setModelStatus);
   };
 

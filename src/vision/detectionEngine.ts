@@ -30,11 +30,20 @@ import type { WorkerRequest, WorkerResponse } from './detector.worker';
 import {
   classSupportFor,
   type ModelDefinition,
+  type DetectorId,
   DFINE_MODEL,
+  MEDIAPIPE_MODEL,
   PRIMARY_MODEL,
   resolveModelCandidates,
   FALLBACK_MODEL,
 } from './models';
+import {
+  MediaPipeFrameRunner,
+  MediaPipeUnavailableError,
+  createMediaPipeDetector,
+  toMediaPipeRawDetections,
+  type MediaPipeDetectorLike,
+} from './mediapipe';
 
 export const DEFAULT_DETECTION_CONFIG: DetectionConfig = {
   confidence: 0.35,
@@ -97,9 +106,16 @@ export class DetectionEngine {
   private lastFrame: DetectionFrame | null = null;
   private lastTracks: Track[] = [];
   private backend: 'onnxruntime-web' | 'tfjs' = 'onnxruntime-web';
-  private preferredDetector: 'yolo11n' | 'dfine-n' = 'yolo11n';
+  private preferredDetector: DetectorId = 'yolo11n';
   private activeDef: ModelDefinition | null = null;
   private lastDFineError: string | null = null;
+  /*
+   * MediaPipe state. Kept separate from the worker because MediaPipe runs on the
+   * main thread and takes the video element directly.
+   */
+  private mediaPipe: MediaPipeFrameRunner | null = null;
+  private mediaPipeLoading = false;
+  private lastMediaPipeError: string | null = null;
   /** Number of consecutive ONNX initialisation failures before fallback. */
   private static onnxBlocked = false;
 
@@ -149,7 +165,7 @@ export class DetectionEngine {
    *            still falls back exactly as before, so this is never a one-way
    *            door.
    */
-  getPreferredDetector(): 'yolo11n' | 'dfine-n' {
+  getPreferredDetector(): DetectorId {
     return this.preferredDetector;
   }
 
@@ -162,10 +178,18 @@ export class DetectionEngine {
    * describe reality instead of advertising a detector that is not running.
    * Returns true when the preference actually changed.
    */
-  setPreferredDetector(next: 'yolo11n' | 'dfine-n'): boolean {
+  setPreferredDetector(next: DetectorId): boolean {
     const changed = this.preferredDetector !== next;
     this.preferredDetector = next;
     if (changed) this.lastDFineError = null;
+    /*
+     * Leaving MediaPipe must release its WASM/GPU resources, otherwise the old
+     * detector keeps a GPU context alive for the rest of the session.
+     */
+    if (changed && next !== 'mediapipe') {
+      this.mediaPipe?.close();
+      this.mediaPipe = null;
+    }
     /*
      * Apply the chosen family's confidence floor.
      *
@@ -176,7 +200,9 @@ export class DetectionEngine {
      * deliberately stricter choice, and the operator can still set any value in
      * the panel afterwards.
      */
-    const floor = (next === 'dfine-n' ? DFINE_MODEL : PRIMARY_MODEL).minConfidence;
+    const def =
+      next === 'dfine-n' ? DFINE_MODEL : next === 'mediapipe' ? MEDIAPIPE_MODEL : PRIMARY_MODEL;
+    const floor = def.minConfidence;
     if (floor !== undefined && this.detectionConfig.confidence < floor) {
       this.detectionConfig = { ...this.detectionConfig, confidence: floor };
     }
@@ -231,6 +257,17 @@ export class DetectionEngine {
     // Opt-in D-FINE attempt. Any failure falls through to the existing
     // YOLO11n -> NanoDet chain below, so the default path is unchanged when the
     // preference is 'yolo11n' (the default) or the asset is absent.
+    /*
+     * Opt-in MediaPipe attempt. Runs on the main thread, so it needs no worker and
+     * no backend preference. Any failure records the reason and falls through to
+     * the existing YOLO11n -> NanoDet chain, exactly like D-FINE.
+     */
+    if (this.preferredDetector === 'mediapipe') {
+      const mp = await this.loadMediaPipe();
+      if (mp.state === 'ready') return mp;
+      this.lastMediaPipeError = mp.message ?? 'MediaPipe unavailable';
+    }
+
     if (preferred === 'onnxruntime-web' && this.preferredDetector === 'dfine-n') {
       const dfine = await this.loadModelWith('onnxruntime-web', DFINE_MODEL);
       if (dfine.state === 'ready') return dfine;
@@ -354,6 +391,145 @@ export class DetectionEngine {
       // re-fetched from a URL the browser may not have.
       worker.postMessage(payload, modelBytes ? [modelBytes.buffer] : []);
     });
+  }
+
+  /**
+   * Load MediaPipe + EfficientDet-Lite0.
+   *
+   * Resolves paths relative to the deployment base so the app works when served
+   * from a sub-path, and never throws: a failure becomes a `not_configured`
+   * status carrying the reason, which `loadModel` then treats as "fall back".
+   */
+  private async loadMediaPipe(): Promise<ModelStatus> {
+    if (this.mediaPipe || this.mediaPipeLoading) return this.modelStatus;
+    this.mediaPipeLoading = true;
+
+    const def = MEDIAPIPE_MODEL;
+    const base = (import.meta.env?.BASE_URL ?? '/').replace(/\/$/, '');
+
+    this.emitModelStatus({
+      id: def.id,
+      name: def.name,
+      family: def.family,
+      url: def.url,
+      state: 'loading',
+      message: `Loading ${def.name}…`,
+      inputSize: def.inputSize,
+      classCount: def.labels.length,
+      classSupport: classSupportFor(def, false, 'loading'),
+    });
+
+    const started = performance.now();
+    try {
+      const detector: MediaPipeDetectorLike = await createMediaPipeDetector({
+        wasmBasePath: `${base}/vendor/mediapipe`,
+        // Overridable so a self-hosted copy can be used without a rebuild.
+        modelAssetPath:
+          (import.meta.env?.VITE_MEDIAPIPE_MODEL_URL as string | undefined) ??
+          `${base}/${def.url.replace(/^\/+/, '')}`,
+        scoreThreshold: Math.max(this.detectionConfig.confidence, def.minConfidence ?? 0.3),
+        delegate: 'GPU',
+      });
+      this.mediaPipe = new MediaPipeFrameRunner(detector);
+      this.activeDef = def;
+      this.modelLoadedFor = { backend: 'mediapipe', url: def.url };
+      this.emitModelStatus({
+        state: 'ready',
+        message: `${def.name} ready (mediapipe)`,
+        loadMs: Math.round(performance.now() - started),
+        executionProvider: 'mediapipe',
+        url: def.url,
+        classSupport: classSupportFor(def, true, 'ready'),
+      });
+      return this.modelStatus;
+    } catch (err) {
+      const detail =
+        err instanceof MediaPipeUnavailableError
+          ? err.detail
+          : err instanceof Error
+          ? err.message
+          : String(err);
+      this.mediaPipe = null;
+      this.lastMediaPipeError = detail;
+      this.emitModelStatus({
+        state: 'not_configured',
+        message: detail,
+        url: def.url,
+        classSupport: classSupportFor(def, false, 'not_configured', detail),
+      });
+      return this.modelStatus;
+    } finally {
+      this.mediaPipeLoading = false;
+    }
+  }
+
+  /**
+   * Why the last MediaPipe load/inference failed, or null.
+   *
+   * Exposed so the panel can explain the fallback ("MediaPipe: run
+   * `npm run setup:models -- --only=mediapipe`") instead of silently reverting to
+   * YOLO11n as though nothing happened.
+   */
+  getMediaPipeError(): string | null {
+    return this.lastMediaPipeError;
+  }
+
+  /** True when the MediaPipe detector is the one currently producing frames. */
+  isMediaPipeActive(): boolean {
+    return this.mediaPipe !== null && this.modelStatus.state === 'ready';
+  }
+
+  /**
+   * Run one MediaPipe inference on the current frame.
+   *
+   * Produces the same `DetectionFrame` as the worker path by going through the
+   * same `buildFrame`, so tracking, class mapping, risk and the overlay cannot
+   * tell which backend ran. Stage counts are filled in here rather than in a
+   * worker message because this path never leaves the main thread.
+   */
+  private tickMediaPipe(video: HTMLVideoElement, width: number, height: number): void {
+    const runner = this.mediaPipe;
+    if (!runner) return;
+
+    const started = performance.now();
+    let raw: { box: BoundingBox; label: string; confidence: number }[];
+    let stages: { raw: number; afterThreshold: number; afterPadding: number };
+    try {
+      const result = runner.detect(video, Date.now());
+      const { detections, dropped } = toMediaPipeRawDetections(result, this.activeDef?.labels ?? COCO_LABELS);
+
+      /*
+       * MediaPipe's own scoreThreshold already filtered, and its boxes are in
+       * source-frame pixels - there is no letterbox filler to reject, so
+       * `afterPadding === afterThreshold`. The number is still reported so the
+       * diagnostic line has the same shape for every backend.
+       */
+      const total = (result.detections ?? []).length + dropped.noBox + dropped.degenerate + dropped.badClass;
+      stages = {
+        raw: Math.max(total, detections.length),
+        afterThreshold: detections.length,
+        afterPadding: detections.length,
+      };
+      raw = detections.map((d) => ({ box: d.box, label: d.label, confidence: d.confidence }));
+    } catch (err) {
+      // A failed frame must not kill the loop: report once, keep the camera live.
+      const message = err instanceof Error ? err.message : String(err);
+      if (this.lastMediaPipeError !== message) {
+        this.lastMediaPipeError = message;
+        this.listeners.onError?.(`MediaPipe inference failed: ${message}`);
+      }
+      return;
+    }
+
+    const latency = performance.now() - started;
+    this.inferenceTimestamps.push(Date.now());
+    this.trimWindow(this.inferenceTimestamps);
+    this.latencySamples.push(latency);
+    if (this.latencySamples.length > 48) this.latencySamples.shift();
+
+    const frame = this.buildFrame(raw, width, height, Date.now(), latency, latency, stages);
+    this.lastFrame = frame;
+    this.listeners.onFrame?.(frame);
   }
 
   /** True when ONNX was found unusable in this environment. */
@@ -548,6 +724,34 @@ export class DetectionEngine {
     const video = source.video;
     const width = video.videoWidth;
     const height = video.videoHeight;
+
+    /*
+     * MediaPipe branch: synchronous on the main thread, takes the video element
+     * directly, needs no letterbox canvas and no worker round-trip. Handled
+     * before the worker path so the two never both run for one frame - which is
+     * also what guarantees only one frame is ever in flight (item 9).
+     */
+    if (this.mediaPipe) {
+      try {
+        this.stats.framesCaptured += 1;
+        this.stats.frameWidth = width;
+        this.stats.frameHeight = height;
+        this.captureTimestamps.push(Date.now());
+        this.trimWindow(this.captureTimestamps);
+        if (width > 0 && height > 0) this.tickMediaPipe(video, width, height);
+      } catch (err) {
+        if (import.meta.env?.DEV) {
+          // eslint-disable-next-line no-console
+          console.error('[bharat-av][mediapipe] frame failed:', err);
+        }
+        this.listeners.onError?.(
+          `MediaPipe frame failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      } finally {
+        this.scheduleNext();
+      }
+      return;
+    }
 
     try {
       const { buffer, geometry } = this.grabLetterboxedFrame(video, width, height, this.inputSize);
@@ -809,6 +1013,8 @@ export class DetectionEngine {
 
   dispose(): void {
     this.stop();
+    this.mediaPipe?.close();
+    this.mediaPipe = null;
     this.worker?.postMessage({ type: 'reset', requestId: this.requestId++ } as WorkerRequest);
     this.worker?.terminate();
     this.worker = null;
