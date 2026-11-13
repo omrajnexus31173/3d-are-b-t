@@ -347,6 +347,18 @@ export const CameraPanel: React.FC<Props> = ({
                 onChange={(e) => actions.setConfig({ confidence: Number(e.target.value) })}
                 className="w-full accent-cyan-400"
               />
+              {/*
+               * D-FINE emits a fixed 300 queries regardless of scene content, so
+               * a threshold tuned for YOLO admits many background slots and
+               * floods the overlay. Say where the safe point is instead of
+               * letting the operator discover it by lowering the slider.
+               */}
+              {state.preferredDetector === 'dfine-n' && state.config.confidence < 0.5 && (
+                <span className="mt-1 block text-[9px] leading-snug text-amber-300/90">
+                  D-FINE returns 300 queries per frame. Below ~50% many are background
+                  slots, which is what makes the overlay dense and overlapping.
+                </span>
+              )}
             </label>
             <label className="block">
               <span className="text-[9.5px] font-mono-tech text-slate-400 flex items-center justify-between">

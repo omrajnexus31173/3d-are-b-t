@@ -13,6 +13,7 @@
  */
 import type { FrameSource } from '../camera/types';
 import { IouTracker, type Track } from './tracker';
+import { detectionDebugEnabled } from './diagnostics';
 import { mapLabelToVisionClass, COCO_LABELS } from './detector';
 import { assessImageRisk, estimateDistance, type CameraCalibration } from './distance';
 import type {
@@ -75,7 +76,7 @@ function emptyStats(): DetectionStats {
 
 export class DetectionEngine {
   private worker: Worker | null = null;
-  private tracker = new IouTracker();
+  private tracker = new IouTracker({ maxTracks: DEFAULT_DETECTION_CONFIG.maxDetections });
   private detectionConfig: DetectionConfig;
   private listeners: DetectionEngineListeners;
   private calibration: CameraCalibration | null = null;
@@ -165,6 +166,20 @@ export class DetectionEngine {
     const changed = this.preferredDetector !== next;
     this.preferredDetector = next;
     if (changed) this.lastDFineError = null;
+    /*
+     * Apply the chosen family's confidence floor.
+     *
+     * A 300-query DETR graph needs a stricter operating point than a YOLO export
+     * (which already suppresses hard by NMS), so switching to D-FINE raises the
+     * threshold to its documented floor instead of silently reusing YOLO's.
+     * Raising is one-way on purpose: lowering it automatically would undo a
+     * deliberately stricter choice, and the operator can still set any value in
+     * the panel afterwards.
+     */
+    const floor = (next === 'dfine-n' ? DFINE_MODEL : PRIMARY_MODEL).minConfidence;
+    if (floor !== undefined && this.detectionConfig.confidence < floor) {
+      this.detectionConfig = { ...this.detectionConfig, confidence: floor };
+    }
     return changed;
   }
 
@@ -560,6 +575,8 @@ export class DetectionEngine {
         nmsIou: this.detectionConfig.nmsIou,
         maxDetections: this.detectionConfig.maxDetections,
         timestampMs: timestamp,
+        // Read here, on the main thread: the worker has no localStorage.
+        debug: detectionDebugEnabled(),
       };
       worker.postMessage(payload, [buffer]);
     } catch (err) {
@@ -718,7 +735,16 @@ export class DetectionEngine {
       .sort((a, b) => {
         const order = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
         return order[a.riskLevel] - order[b.riskLevel] || b.confidence - a.confidence;
-      });
+      })
+      /*
+       * Final ceiling on what is rendered.
+       *
+       * The tracker bounds its own live set, but a frame must never be able to
+       * hand an unbounded list to the overlay: `maxDetections` is the operator's
+       * stated budget, so enforce it here as well as in the worker. Sorted above,
+       * so the cut keeps the highest-risk / highest-confidence boxes.
+       */
+      .slice(0, Math.max(1, this.detectionConfig.maxDetections));
 
     this.stats.detectionCount = detections.length;
     /*

@@ -10,8 +10,14 @@
  * Messages are plain structured-clone objects; frames are transferred as
  * ImageBitmap to avoid copies.
  */
-import { decodeDFineOutput } from './dfine';
+import { decodeDFineWithStats } from './dfine';
 import { decodeYoloOutput, nonMaxSuppression, unletterboxBox } from './detector';
+import {
+  emptyDetectionStats,
+  logDiagnostic,
+  type DetectionDiagnostic,
+  type DetectionStatsSummary,
+} from './diagnostics';
 
 import type { BoundingBox } from './types';
 import {
@@ -59,6 +65,8 @@ export type WorkerRequest =
       nmsIou: number;
       maxDetections: number;
       timestampMs: number;
+      /** Mirrors the main thread's debug toggle; a worker has no localStorage. */
+      debug?: boolean;
     }
   | { type: 'reset'; requestId: number };
 
@@ -372,22 +380,30 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
         return { dims: Array.from(t.dims), data: t.data as ArrayLike<number> };
       };
 
-      const decoded = decodeDFineOutput(
-        {
-          labels: asTensor('labels'),
-          boxes: asTensor('boxes'),
-          scores: asTensor('scores'),
-        },
-        { threshold: msg.threshold, labels: onnxLoaded.labels, maxDetections: msg.maxDetections }
-      );
+      const tensors = {
+        labels: asTensor('labels'),
+        boxes: asTensor('boxes'),
+        scores: asTensor('scores'),
+      };
+      const { detections: decoded, counts } = decodeDFineWithStats(tensors, {
+        threshold: msg.threshold,
+        labels: onnxLoaded.labels,
+        maxDetections: msg.maxDetections,
+      });
 
-      // No NMS: the graph's top-k already yields one row per query.
+      // No NMS by default: the graph's top-k already yields one row per query.
       const detections = decoded.map((d) => ({
         box: unletterboxBox(d.box, geometry, msg.frameWidth, msg.frameHeight),
         label: onnxLoaded.labels[d.classIndex] ?? `class ${d.classIndex}`,
         classIndex: d.classIndex,
         confidence: d.confidence,
       }));
+
+      reportDiagnostic('dfine', counts, detections, {
+        labels: tensors.labels.dims,
+        boxes: tensors.boxes.dims,
+        scores: tensors.scores.dims,
+      }, msg.frameWidth, msg.frameHeight, msg.debug);
 
       post({
         type: 'result',
@@ -431,6 +447,25 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
       };
     });
 
+    // YOLO decoding itself is untouched; this only reports what it produced.
+    // `raw` counts NMS candidates (already thresholded by decodeYoloOutput),
+    // which is the meaningful "before suppression" number for this path.
+    {
+      const counts = emptyDetectionStats(msg.threshold);
+      counts.raw = decoded.length;
+      counts.kept = detections.length;
+      counts.belowThreshold = 0;
+      const scores = decoded.map((d) => d.confidence);
+      counts.scoreMin = scores.length ? Math.min(...scores) : 0;
+      counts.scoreMax = scores.length ? Math.max(...scores) : 0;
+      const keptScores = detections.map((d) => d.confidence);
+      counts.keptScoreMin = keptScores.length ? Math.min(...keptScores) : 0;
+      counts.keptScoreMax = keptScores.length ? Math.max(...keptScores) : 0;
+      reportDiagnostic('yolo', counts, detections, {
+        out0: raw[0]?.dims ?? [],
+      }, msg.frameWidth, msg.frameHeight, msg.debug);
+    }
+
     post({
       type: 'result',
       requestId: msg.requestId,
@@ -450,6 +485,28 @@ async function handleInfer(msg: Extract<WorkerRequest, { type: 'infer' }>) {
       message: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/** Build and emit one diagnostic record for a completed inference. */
+function reportDiagnostic(
+  detector: DetectionDiagnostic['detector'],
+  counts: DetectionStatsSummary,
+  detections: { box: BoundingBox; label: string; confidence: number }[],
+  rawShapes: Record<string, readonly number[]>,
+  frameWidth: number,
+  frameHeight: number,
+  debug?: boolean
+): void {
+  logDiagnostic({
+    detector,
+    rawShapes,
+    counts,
+    // Strongest first keeps the "top=" part of the line useful.
+    boxes: [...detections]
+      .sort((a, b) => b.confidence - a.confidence)
+      .map((d) => ({ label: d.label, confidence: d.confidence, box: d.box })),
+    frame: { width: frameWidth, height: frameHeight },
+  }, debug);
 }
 
 /** NMS in frame space, used by the TF.js path (already mapped to pixels). */

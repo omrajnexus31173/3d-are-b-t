@@ -47,6 +47,16 @@ export interface ModelDefinition {
   labels: readonly string[];
   /** ONNX I/O contract. Defaults to 'yolo' when omitted. */
   onnxFamily?: ModelOnnxFamily;
+  /**
+   * Minimum confidence this model family needs to behave sanely.
+   *
+   * A DETR/D-FINE graph always emits `num_top_queries` rows (300) regardless of
+   * scene content, so a YOLO-tuned threshold (~0.35) admits a large share of
+   * low-scoring query slots that scatter across the frame. This floor is applied
+   * when the detector is selected so the operator gets D-FINE's own operating
+   * point rather than YOLO's. Omitted for YOLO, whose behaviour is unchanged.
+   */
+  minConfidence?: number;
   /** Format hint for the backend loader. */
   description: string;
   /** Env-var style override key documented in the README. */
@@ -205,6 +215,13 @@ export const DFINE_MODEL: ModelDefinition = {
   url: 'models/dfine_n_coco.onnx',
   altUrls: ['models/dfine_n.onnx', 'models/model.onnx'],
   onnxFamily: 'dfine',
+  /*
+   * 0.5, not the 0.35 default. D-FINE's reference demo draws at 0.40
+   * (onnx_inf.py `thrh=0.4`), and its 300 queries are NOT pre-filtered, so the
+   * default must be at least as strict as the reference. 0.35 sits below the
+   * reference operating point and is what produced an over-dense overlay.
+   */
+  minConfidence: 0.5,
   inputSize: 640,
   labels: COCO_LABELS,
   description:
