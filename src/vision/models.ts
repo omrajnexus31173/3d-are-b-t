@@ -15,6 +15,19 @@ import { ModelClassSupport, ModelStatus, VisionClassId } from './types';
 
 export type ModelBackend = 'onnxruntime-web' | 'tfjs';
 
+/**
+ * ONNX I/O contract a model speaks.
+ *
+ * 'yolo'  - single `images` input, N outputs, decoded + NMS'd in the worker.
+ * 'dfine' - `images` + int64 `orig_target_sizes` inputs; `labels`, `boxes`,
+ *           `scores` outputs; NMS-free with the decoder inside the graph.
+ *
+ * Declared here for documentation and selection UI, but the worker re-detects
+ * the contract from the session's own input names, so a mislabelled registry
+ * entry cannot route a model down the wrong path.
+ */
+export type ModelOnnxFamily = 'yolo' | 'dfine';
+
 
 export interface ModelDefinition {
   id: string;
@@ -32,6 +45,8 @@ export interface ModelDefinition {
   fallback?: ModelDefinition;
   inputSize: number;
   labels: readonly string[];
+  /** ONNX I/O contract. Defaults to 'yolo' when omitted. */
+  onnxFamily?: ModelOnnxFamily;
   /** Format hint for the backend loader. */
   description: string;
   /** Env-var style override key documented in the README. */
@@ -62,15 +77,15 @@ const GENERIC_UNSUPPORTED = [
 
 export const POTHOLE_UNSUPPORTED_FOR_GENERIC = GENERIC_UNSUPPORTED[0];
 
-export const PRIMARY_MODEL: ModelDefinition = {
-  id: 'yolo11n-coco',
-  name: 'YOLO11n (COCO)',
-  family: 'yolo11',
-  backend: 'onnxruntime-web',
-  url: 'models/yolo11n.onnx',
-  altUrls: ['models/yolov8n.onnx', 'models/yolo11n-fp16.onnx'],
-  inputSize: 640,
-  labels: [
+/**
+ * COCO-80 label table in contiguous 0..79 order.
+ *
+ * Shared by every COCO model here. D-FINE's deploy-mode postprocessor returns
+ * `index % num_classes` BEFORE `remap_mscoco_category`, so its labels are
+ * contiguous 0..79 rather than sparse 1..90 COCO category ids - the same
+ * ordering this table already uses. One copy, so the two cannot drift apart.
+ */
+export const COCO_LABELS: readonly string[] = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
     'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
     'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
@@ -82,7 +97,17 @@ export const PRIMARY_MODEL: ModelDefinition = {
     'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
     'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
     'toothbrush',
-  ],
+];
+
+export const PRIMARY_MODEL: ModelDefinition = {
+  id: 'yolo11n-coco',
+  name: 'YOLO11n (COCO)',
+  family: 'yolo11',
+  backend: 'onnxruntime-web',
+  url: 'models/yolo11n.onnx',
+  altUrls: ['models/yolov8n.onnx', 'models/yolo11n-fp16.onnx'],
+  inputSize: 640,
+  labels: COCO_LABELS,
   description:
     'Ultralytics YOLO11n exported to ONNX (COCO-80). Person, bicycle, car, motorcycle, bus, truck and cow/animal classes.',
   overrideKey: 'VITE_YOLO_MODEL_URL',
@@ -161,8 +186,47 @@ export const POTHOLE_MODEL: ModelDefinition = {
   source: 'user-supplied (RDD2022 / custom pothole dataset)',
 };
 
+/**
+ * D-FINE-N (COCO). Selectable alternative to YOLO11n - NOT the default.
+ *
+ * Needs a 2-input / 3-output ONNX graph exported by the D-FINE authors' own
+ * `tools/deployment/export_onnx.py` (opset 16, decoder baked in). Install it
+ * with `npm run setup:models -- --dfine` or drop the file at
+ * `public/models/dfine_n_coco.onnx`.
+ *
+ * Deliberately not wired into PRIMARY_MODEL: if the asset is missing, YOLO11n
+ * keeps working. `dfineAvailable()` gates the selection UI on presence.
+ */
+export const DFINE_MODEL: ModelDefinition = {
+  id: 'dfine-n-coco',
+  name: 'D-FINE-N (COCO)',
+  family: 'dfine',
+  backend: 'onnxruntime-web',
+  url: 'models/dfine_n_coco.onnx',
+  altUrls: ['models/dfine_n.onnx', 'models/model.onnx'],
+  onnxFamily: 'dfine',
+  inputSize: 640,
+  labels: COCO_LABELS,
+  description:
+    'D-FINE-N DETR-family detector, NMS-free, decoder inside the ONNX graph. ' +
+    'Requires a 2-input (images + orig_target_sizes) / 3-output export.',
+  overrideKey: 'VITE_DFINE_MODEL_URL',
+  supportedClasses: [
+    'pedestrian',
+    'cattle',
+    'animal_other',
+    'car',
+    'truck_bus',
+    'motorcycle',
+    'bicycle',
+  ],
+  unsupportedClasses: GENERIC_UNSUPPORTED,
+  approxBytes: 12 * 1024 * 1024,
+  source: 'D-FINE official release → tools/deployment/export_onnx.py (opset 16)',
+};
+
 /** Optional fp16 / nanodet-style browser fallback (see README). */
-export const ALL_MODELS: ModelDefinition[] = [PRIMARY_MODEL, POTHOLE_MODEL];
+export const ALL_MODELS: ModelDefinition[] = [PRIMARY_MODEL, DFINE_MODEL, POTHOLE_MODEL];
 
 /** The model actually used when the primary backend is unavailable. */
 export function withBackendOverride(
@@ -268,4 +332,18 @@ export function resolveModelCandidates(def: ModelDefinition): string[] {
   out.push(`${base}/${def.url.replace(/^\//, '')}`);
   for (const alt of def.altUrls ?? []) out.push(`${base}/${alt.replace(/^\//, '')}`);
   return Array.from(new Set(out));
+}
+
+/**
+ * True when the D-FINE asset is actually installed. Used to gate the selection
+ * UI so a missing optional model never looks like a broken app.
+ */
+export async function dfineAssetAvailable(): Promise<boolean> {
+  if (readEnv('VITE_DFINE_MODEL_URL')) return true;
+  try {
+    const res = await fetch(resolveModelUrl(DFINE_MODEL), { method: 'HEAD' });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }

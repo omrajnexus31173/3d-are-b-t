@@ -42,6 +42,20 @@ const YOLO_URL =
 const YOLO_FALLBACK_URLS = [
   'https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.onnx',
 ];
+/**
+ * D-FINE-N is OPTIONAL and has no public pre-built ONNX: the authors ship only
+ * PyTorch checkpoints, so the .onnx must be produced with their
+ * tools/deployment/export_onnx.py (see _validation-only/dfine-n-windows-kit).
+ *
+ * Set DFINE_MODEL_URL to any reachable URL, or just drop the file at
+ * public/models/dfine_n_coco.onnx and skip this step. Nothing here fabricates a
+ * model: if no source is configured the step reports SKIPPED and YOLO11n stays
+ * the working detector.
+ */
+const DFINE_URL =
+  process.env.DFINE_MODEL_URL ??
+  'https://github.com/omrajnexus31173/3d-are-b-t/releases/download/dfine-n-v1/dfine_n_coco.onnx';
+const DFINE_DEST = path.join(PUBLIC, 'models', 'dfine_n_coco.onnx');
 const NANODET_PACKAGE = process.env.TFJS_MODEL_PACKAGE ?? '@vladmandic/human-models@3.0.4';
 const TFJS_PACKAGE = process.env.TFJS_PACKAGE ?? '@tensorflow/tfjs@4.22.0';
 
@@ -265,6 +279,67 @@ async function installPothole() {
   }
 }
 
+
+/**
+ * Copy or download the opt-in D-FINE-N graph.
+ *
+ * Deliberately never fatal: a missing optional detector must not fail
+ * `npm run setup:models` or break the app, which still runs YOLO11n.
+ */
+async function installDfine() {
+  log('\n=== D-FINE-N (optional) ===');
+  if (await exists(DFINE_DEST)) {
+    const size = await exists(DFINE_DEST);
+    // A cached file is only trustworthy if it still validates - a previously
+    // interrupted build can leave a truncated or non-ONNX artifact behind.
+    const v = await verifyOnnx(DFINE_DEST);
+    if (v.ok) {
+      log(`already present: ${path.relative(ROOT, DFINE_DEST)} (${formatBytes(size)}, sha256:${v.sha256.slice(0, 16)}…)`);
+      return 'present';
+    }
+    warn(`existing ${path.relative(ROOT, DFINE_DEST)} is invalid (${v.reason}) - re-downloading`);
+    await rm(DFINE_DEST, { force: true });
+  }
+  const onVercel = process.env.VERCEL === '1';
+  if (!DFINE_URL) {
+    log('SKIPPED - no DFINE_MODEL_URL set and no file at public/models/dfine_n_coco.onnx');
+    log('  To enable the D-FINE detector either:');
+    log('    1. export it with tools/deployment/export_onnx.py (see the validation kit), then');
+    log('       copy the .onnx to public/models/dfine_n_coco.onnx; or');
+    log('    2. set DFINE_MODEL_URL=<url> and re-run this script.');
+    log('  Until then the app uses YOLO11n and the D-FINE option stays hidden.');
+    return 'skipped';
+  }
+  log(`downloading ${DFINE_URL}`);
+  try {
+    // Reuse the project's existing downloader + ONNX validator rather than a
+    // parallel implementation: it already rejects Git-LFS pointers, HTML error
+    // pages and truncated files.
+    const size = await download(DFINE_URL, DFINE_DEST, { minBytes: 1_000_000 });
+    const v = await verifyOnnx(DFINE_DEST);
+    if (!v.ok) {
+      await rm(DFINE_DEST, { force: true });
+      throw new Error(`verification failed: ${v.reason}`);
+    }
+    log(`D-FINE-N -> ${path.relative(ROOT, DFINE_DEST)} (${formatBytes(size)}, sha256:${v.sha256.slice(0, 16)}…)`);
+    return 'installed';
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (onVercel) {
+      // A Vercel build MUST ship the asset: otherwise the deployed app would
+      // advertise a D-FINE option whose weights 404. Fail the build instead.
+      throw new Error(
+        `D-FINE download failed during the Vercel build: ${msg}\n` +
+          `  url: ${DFINE_URL}\n` +
+          '  Either set DFINE_MODEL_URL to a reachable URL, or remove VITE_DFINE_MODEL_URL ' +
+          'so this deployment does not advertise D-FINE.'
+      );
+    }
+    warn(`download failed (${msg}) - D-FINE stays disabled, YOLO11n unaffected`);
+    return 'failed';
+  }
+}
+
 async function main() {
   log('installing BHARAT-AV detection assets (public/ is git-ignored)');
   const results = {};
@@ -272,11 +347,19 @@ async function main() {
   if (shouldRun('ort')) results.ort = await installOrt();
   if (shouldRun('tfjs')) results.tfjs = await installTfjsFallback();
   if (shouldRun('pothole')) results.pothole = await installPothole();
+  // Local default: skipped unless asked for, to keep `npm run setup:models`
+  // from pulling an extra 15 MB nobody requested.
+  // Vercel default: installed, so the deployed build actually contains it.
+  if (shouldRun('dfine') || (process.env.VERCEL === '1' && !only)) {
+    results.dfine = await installDfine();
+  }
   await rm(path.join(ROOT, '.cache-models'), { recursive: true, force: true });
 
   log('--- summary ---');
   for (const [k, v] of Object.entries(results)) {
-    log(`${v ? 'ok  ' : 'miss'} ${k}`);
+    const ok = v === true || v === 'installed' || v === 'present';
+    const note = typeof v === 'string' && !ok ? ` (${v})` : '';
+    log(`${ok ? 'ok  ' : 'miss'} ${k}${note}`);
   }
   if (!results.yolo) {
     warn('Detection will report "model not configured" until weights are installed.');

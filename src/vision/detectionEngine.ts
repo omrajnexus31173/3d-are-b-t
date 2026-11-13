@@ -29,6 +29,7 @@ import type { WorkerRequest, WorkerResponse } from './detector.worker';
 import {
   classSupportFor,
   type ModelDefinition,
+  DFINE_MODEL,
   PRIMARY_MODEL,
   resolveModelCandidates,
   FALLBACK_MODEL,
@@ -95,6 +96,9 @@ export class DetectionEngine {
   private lastFrame: DetectionFrame | null = null;
   private lastTracks: Track[] = [];
   private backend: 'onnxruntime-web' | 'tfjs' = 'onnxruntime-web';
+  private preferredDetector: 'yolo11n' | 'dfine-n' = 'yolo11n';
+  private activeDef: ModelDefinition | null = null;
+  private lastDFineError: string | null = null;
   /** Number of consecutive ONNX initialisation failures before fallback. */
   private static onnxBlocked = false;
 
@@ -132,7 +136,24 @@ export class DetectionEngine {
 
   /** Which model definition is in use (primary or fallback). */
   getModelDefinition(): ModelDefinition {
+    if (this.activeDef) return this.activeDef;
     return this.backend === 'tfjs' ? FALLBACK_MODEL : PRIMARY_MODEL;
+  }
+
+  /**
+   * Which optional detector to prefer on the ONNX path.
+   *
+   * 'yolo11n' (default) leaves existing behaviour completely untouched.
+   * 'dfine-n'  opts in to the D-FINE graph; if it fails to load, loadModel()
+   *            still falls back exactly as before, so this is never a one-way
+   *            door.
+   */
+  getPreferredDetector(): 'yolo11n' | 'dfine-n' {
+    return this.preferredDetector;
+  }
+
+  setPreferredDetector(next: 'yolo11n' | 'dfine-n'): void {
+    this.preferredDetector = next;
   }
 
   getConfig(): DetectionConfig {
@@ -180,6 +201,16 @@ export class DetectionEngine {
     const preferred: 'onnxruntime-web' | 'tfjs' =
       backendOverride ?? (DetectionEngine.onnxBlocked ? 'tfjs' : 'onnxruntime-web');
 
+    // Opt-in D-FINE attempt. Any failure falls through to the existing
+    // YOLO11n -> NanoDet chain below, so the default path is unchanged when the
+    // preference is 'yolo11n' (the default) or the asset is absent.
+    if (preferred === 'onnxruntime-web' && this.preferredDetector === 'dfine-n') {
+      const dfine = await this.loadModelWith('onnxruntime-web', DFINE_MODEL);
+      if (dfine.state === 'ready') return dfine;
+      // Keep the D-FINE reason but continue to the normal chain.
+      this.lastDFineError = dfine.message ?? 'D-FINE model unavailable';
+    }
+
     const first = await this.loadModelWith(preferred);
     if (first.state === 'ready' || backendOverride) return first;
 
@@ -187,7 +218,8 @@ export class DetectionEngine {
     // fall back to the TF.js detector and say so explicitly.
     const fallback = await this.loadModelWith(preferred === 'tfjs' ? 'onnxruntime-web' : 'tfjs');
     if (fallback.state === 'ready') {
-      fallback.message = `${fallback.name} (fallback) — ${first.message ?? 'primary detector unavailable'}`;
+      const dfineNote = this.lastDFineError ? ` [D-FINE: ${this.lastDFineError}]` : '';
+      fallback.message = `${fallback.name} (fallback) — ${first.message ?? 'primary detector unavailable'}${dfineNote}`;
       this.listeners.onModelStatus?.(fallback);
       return fallback;
     }
@@ -203,6 +235,7 @@ export class DetectionEngine {
   ): Promise<ModelStatus> {
     const def = customDef ?? (backend === 'tfjs' ? FALLBACK_MODEL : PRIMARY_MODEL);
     this.backend = backend;
+    this.activeDef = def;
 
     this.emitModelStatus({
       id: def.id,
