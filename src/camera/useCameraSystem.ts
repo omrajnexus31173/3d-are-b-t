@@ -39,7 +39,7 @@ import {
   type CreateSessionResult,
 } from './signalClient';
 import type { CameraCalibration } from '../vision/distance';
-import { POTHOLE_MODEL } from '../vision/models';
+import { POTHOLE_MODEL, type DetectorId } from '../vision/models';
 
 /**
  * Pick the host a *phone* should use to open this app.
@@ -115,7 +115,7 @@ export interface CameraSystemState {
   /** Modes available for the selected device (device-reported when possible). */
   resolutionOptions: CameraResolutionOption[];
   /** Detector the operator selected. YOLO11n is the default. */
-  preferredDetector: 'yolo11n' | 'dfine-n';
+  preferredDetector: DetectorId;
 }
 
 export interface CameraSystemActions {
@@ -137,7 +137,7 @@ export interface CameraSystemActions {
    * Select YOLO11n or D-FINE-N and (re)load it. Returns the resulting status so
    * the caller can react to a D-FINE failure that fell back to YOLO11n.
    */
-  selectDetector: (id: 'yolo11n' | 'dfine-n') => Promise<ModelStatus>;
+  selectDetector: (id: DetectorId) => Promise<ModelStatus>;
   dismissError: () => void;
 }
 
@@ -170,7 +170,7 @@ export function useCameraSystem(
   const [sourceKind, setSourceKind] = useState<CameraSourceKind | null>(null);
   const [config, setConfigState] = useState<DetectionConfig>(DEFAULT_DETECTION_CONFIG);
   const [calibration, setCalibrationState] = useState<CameraCalibration | null>(null);
-  const [preferredDetector, setPreferredDetectorState] = useState<'yolo11n' | 'dfine-n'>('yolo11n');
+  const [preferredDetector, setPreferredDetectorState] = useState<DetectorId>('yolo11n');
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sourceRef = useRef<FrameSource | null>(null);
@@ -557,7 +557,7 @@ export function useCameraSystem(
    * would score frames with the old session while the panel claims the new one.
    * The operator presses Start detection again once the new model is ready.
    */
-  const selectDetector = useCallback(async (id: 'yolo11n' | 'dfine-n') => {
+  const selectDetector = useCallback(async (id: DetectorId) => {
     const engine = engineRef.current;
     setPreferredDetectorState(id);
     if (!engine) return { state: 'error' } as ModelStatus;

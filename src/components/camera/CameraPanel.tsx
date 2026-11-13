@@ -24,7 +24,7 @@ import {
 import type { CameraSystemActions, CameraSystemState } from '../../camera/useCameraSystem';
 import type { ModelStatus } from '../../vision/types';
 import { VISION_CLASS_COLORS, VISION_CLASS_LABELS } from '../../vision/detector';
-import { classSupportFor, DFINE_MODEL, POTHOLE_MODEL, PRIMARY_MODEL } from '../../vision/models';
+import { classSupportFor, DFINE_MODEL, MEDIAPIPE_MODEL, POTHOLE_MODEL, PRIMARY_MODEL, type DetectorId } from '../../vision/models';
 import { DetectionOverlay } from './DetectionOverlay';
 import { QrPairingPanel } from './QrPairingPanel';
 
@@ -35,7 +35,7 @@ interface Props {
   modelStatus: ModelStatus | null;
   onLoadModel: () => void;
   /** Select + load a detector, updating the parent's modelStatus from the result. */
-  onSelectDetector: (id: 'yolo11n' | 'dfine-n') => void;
+  onSelectDetector: (id: DetectorId) => void;
   onUploadPothole: (file: File) => Promise<void>;
 }
 
@@ -476,12 +476,13 @@ export const CameraPanel: React.FC<Props> = ({
         <div className="flex items-center gap-1.5 mb-2">
           <select
             value={state.preferredDetector}
-            onChange={(e) => onSelectDetector(e.target.value as 'yolo11n' | 'dfine-n')}
+            onChange={(e) => onSelectDetector(e.target.value as DetectorId)}
             disabled={state.modelLoadState === 'loading'}
             title="YOLO11n is the default. D-FINE-N must be installed in public/models/dfine_n_coco.onnx (the production build downloads it from the GitHub release)."
             className="flex-1 min-w-0 bg-[#0B0F17] border border-slate-400/20 rounded-lg px-2 py-1 text-[10.5px] font-mono-tech text-slate-200 outline-none focus:border-cyan-400/50 disabled:opacity-50"
           >
             <option value="yolo11n">{PRIMARY_MODEL.name}</option>
+            <option value="mediapipe">{MEDIAPIPE_MODEL.name}</option>
             <option value="dfine-n">{DFINE_MODEL.name}</option>
           </select>
         </div>

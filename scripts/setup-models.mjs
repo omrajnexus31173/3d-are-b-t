@@ -59,6 +59,18 @@ const DFINE_DEST = path.join(PUBLIC, 'models', 'dfine_n_coco.onnx');
 const NANODET_PACKAGE = process.env.TFJS_MODEL_PACKAGE ?? '@vladmandic/human-models@3.0.4';
 const TFJS_PACKAGE = process.env.TFJS_PACKAGE ?? '@tensorflow/tfjs@4.22.0';
 
+/*
+ * MediaPipe object detector: the official WordPress-hosted EfficientDet-Lite0
+ * asset and the npm-bundled WASM runtime. Both are optional - if they cannot be
+ * fetched, YOLO11n and D-FINE-N are untouched and the MediaPipe option simply
+ * reports "not configured".
+ */
+const MEDIAPIPE_MODEL_URL =
+  process.env.MEDIAPIPE_MODEL_URL ??
+  'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite';
+const MEDIAPIPE_MODEL_DEST = path.join(PUBLIC, 'models', 'efficientdet_lite0.tflite');
+const MEDIAPIPE_WASM_DEST = path.join(PUBLIC, 'vendor', 'mediapipe');
+
 const args = process.argv.slice(2);
 const only = args
   .find((a) => a.startsWith('--only='))
@@ -340,6 +352,46 @@ async function installDfine() {
   }
 }
 
+/**
+ * Copy MediaPipe's WASM runtime out of node_modules and fetch the Lite0 model.
+ *
+ * The WASM files ship inside the npm package, so they are copied locally rather
+ * than pulled from a CDN - no runtime dependency on Google's servers, and no
+ * jsdelivr/unpkg in the critical path.
+ */
+async function installMediaPipe() {
+  const pkg = path.join(ROOT, 'node_modules', '@mediapipe', 'tasks-vision');
+  const wasmSrc = path.join(pkg, 'wasm');
+  if (!(await exists(path.join(wasmSrc, 'vision_wasm_internal.wasm')))) {
+    warn('@mediapipe/tasks-vision is not installed — run `npm install` first.');
+    return false;
+  }
+  await mkdir(MEDIAPIPE_WASM_DEST, { recursive: true });
+  const wasmFiles = (await readdir(wasmSrc)).filter((f) => /^vision_wasm.*\.(js|wasm)$/.test(f));
+  let wasmBytes = 0;
+  for (const f of wasmFiles) {
+    await copyFile(path.join(wasmSrc, f), path.join(MEDIAPIPE_WASM_DEST, f));
+    wasmBytes += await exists(path.join(MEDIAPIPE_WASM_DEST, f));
+  }
+  log(`✅ MediaPipe WASM copied (${wasmFiles.length} files, ${formatBytes(wasmBytes)}) → public/vendor/mediapipe/`);
+
+  // Model: keep an existing valid file unless --force.
+  const existing = await exists(MEDIAPIPE_MODEL_DEST);
+  if (existing > 1_000_000 && !force) {
+    log(`✅ EfficientDet-Lite0 present (${formatBytes(existing)}) — skipping download`);
+    return 'present';
+  }
+  try {
+    const size = await download(MEDIAPIPE_MODEL_URL, MEDIAPIPE_MODEL_DEST, { minBytes: 1_000_000 });
+    log(`✅ EfficientDet-Lite0 (${formatBytes(size)}) → public/models/efficientdet_lite0.tflite`);
+    return 'installed';
+  } catch (err) {
+    warn(`EfficientDet-Lite0 download failed (${err.message}) — MediaPipe stays disabled, YOLO11n unaffected`);
+    // The WASM runtime is still useful, so report partial success distinctly.
+    return 'failed';
+  }
+}
+
 async function main() {
   log('installing BHARAT-AV detection assets (public/ is git-ignored)');
   const results = {};
@@ -347,6 +399,7 @@ async function main() {
   if (shouldRun('ort')) results.ort = await installOrt();
   if (shouldRun('tfjs')) results.tfjs = await installTfjsFallback();
   if (shouldRun('pothole')) results.pothole = await installPothole();
+  if (shouldRun('mediapipe')) results.mediapipe = await installMediaPipe();
   // Local default: skipped unless asked for, to keep `npm run setup:models`
   // from pulling an extra 15 MB nobody requested.
   // Vercel default: installed, so the deployed build actually contains it.

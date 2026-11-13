@@ -13,7 +13,16 @@
  */
 import { ModelClassSupport, ModelStatus, VisionClassId } from './types';
 
-export type ModelBackend = 'onnxruntime-web' | 'tfjs';
+export type ModelBackend = 'onnxruntime-web' | 'tfjs' | 'mediapipe';
+
+/**
+ * Detector the operator can choose.
+ *
+ * YOLO11n remains the default; D-FINE-N and MediaPipe are opt-in. Having one name
+ * for this union keeps the engine, the hook and the panel from drifting apart -
+ * previously each redeclared it as a literal union.
+ */
+export type DetectorId = 'yolo11n' | 'dfine-n' | 'mediapipe';
 
 /**
  * ONNX I/O contract a model speaks.
@@ -242,15 +251,73 @@ export const DFINE_MODEL: ModelDefinition = {
   source: 'D-FINE official release → tools/deployment/export_onnx.py (opset 16)',
 };
 
+/**
+ * MediaPipe Tasks Vision + EfficientDet-Lite0 (COCO-80).
+ *
+ * Selectable alternative alongside YOLO11n and D-FINE-N; NOT the default, so a
+ * deployment without the asset keeps working exactly as before.
+ *
+ * Chosen because MediaPipe does its own resize/normalise internally and returns
+ * boxes in source-frame pixels - there is no letterbox to invert and no query
+ * decode to get wrong. EfficientDet-Lite0 already NMS's inside the graph, so the
+ * output is one box per object rather than a ranked query set.
+ *
+ * Assets are not committed (`.gitignore`: public/models, public/vendor). Install
+ * with `npm run setup:models -- --only=mediapipe`.
+ */
+export const MEDIAPIPE_MODEL: ModelDefinition = {
+  id: 'mediapipe-efficientdet-lite0',
+  name: 'MediaPipe EfficientDet-Lite0',
+  family: 'mediapipe',
+  backend: 'mediapipe',
+  url: 'models/efficientdet_lite0.tflite',
+  altUrls: ['models/efficientdet_lite0_fp16.tflite'],
+  /*
+   * EfficientDet-Lite0 is 320x320 internally, but MediaPipe accepts any input
+   * resolution and handles the scaling itself, so this is informational: nothing
+   * in the MediaPipe path preprocesses to this size.
+   */
+  inputSize: 320,
+  labels: COCO_LABELS,
+  /*
+   * 0.3 is the published MediaPipe sample's operating point. Safe to be lower
+   * than the DETR thresholds because EfficientDet's output is already NMS'd -
+   * a low cut adds genuine weak detections, not rows of background queries.
+   */
+  minConfidence: 0.3,
+  description:
+    'Google MediaPipe Tasks Vision ObjectDetector with EfficientDet-Lite0 (COCO-80). ' +
+    'Handles its own preprocessing; boxes come back in source-frame pixels.',
+  overrideKey: 'VITE_MEDIAPIPE_MODEL_URL',
+  supportedClasses: [
+    'pedestrian',
+    'bicycle',
+    'car',
+    'motorcycle',
+    'truck_bus',
+    'cattle',
+    'animal_other',
+  ],
+  unsupportedClasses: GENERIC_UNSUPPORTED,
+  approxBytes: 4_500_000,
+  source:
+    'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite',
+};
+
 /** Optional fp16 / nanodet-style browser fallback (see README). */
-export const ALL_MODELS: ModelDefinition[] = [PRIMARY_MODEL, DFINE_MODEL, POTHOLE_MODEL];
+export const ALL_MODELS: ModelDefinition[] = [
+  PRIMARY_MODEL,
+  DFINE_MODEL,
+  MEDIAPIPE_MODEL,
+  POTHOLE_MODEL,
+];
 
 /** The model actually used when the primary backend is unavailable. */
 export function withBackendOverride(
   def: ModelDefinition,
   backend: ModelBackend
 ): ModelDefinition {
-  if (backend === 'onnxruntime-web') return def;
+  if (backend === 'onnxruntime-web' || backend === 'mediapipe') return def;
   if (def.fallback) return def.fallback;
   return def;
 }
