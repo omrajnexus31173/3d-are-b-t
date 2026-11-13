@@ -42,6 +42,18 @@ export interface TrackerOptions {
   maxMissed?: number;
   /** Track ids confirmed only after N hits are exposed. */
   minHits?: number;
+  /**
+   * Hard ceiling on simultaneously live tracks.
+   *
+   * Without it the track count is unbounded: every unmatched detection spawns a
+   * track, and a track survives `maxMissed` frames after it stops being matched.
+   * A detector that emits many scattered low-confidence boxes (e.g. a 300-query
+   * D-FINE graph thresholded too loosely) therefore accumulates hundreds of
+   * stale tracks and renders hundreds of overlapping boxes, even though each
+   * individual frame contained far fewer. When the ceiling is hit the weakest
+   * (lowest confidence EMA) unverified tracks are dropped first.
+   */
+  maxTracks?: number;
 }
 
 const PREFIX = 'CAM';
@@ -52,12 +64,16 @@ export class IouTracker {
   private readonly iouThreshold: number;
   private readonly maxMissed: number;
   private readonly minHits: number;
+  private readonly maxTracks: number;
   private readonly prefix: string;
 
   constructor(options: TrackerOptions = {}, prefix = PREFIX) {
     this.iouThreshold = options.iouThreshold ?? 0.3;
     this.maxMissed = options.maxMissed ?? 10;
     this.minHits = options.minHits ?? 1;
+    // 64 is comfortably above a real traffic scene while still bounding the
+    // overlay; the previous behaviour was effectively unlimited.
+    this.maxTracks = options.maxTracks ?? 64;
     this.prefix = prefix;
   }
 
@@ -144,7 +160,28 @@ export class IouTracker {
       this.tracks.set(trackId, track);
     }
 
+    if (this.tracks.size > this.maxTracks) this.evictWeakest();
+
     return this.getTracks();
+  }
+
+  /**
+   * Trim the live set to `maxTracks`.
+   *
+   * Unverified tracks (one hit, no repeat confirmation) are dropped before
+   * established ones, and within each group the lowest confidence goes first, so
+   * a genuinely tracked object is never evicted in favour of a one-frame blip.
+   */
+  private evictWeakest(): void {
+    const ranked = Array.from(this.tracks.values()).sort(
+      (a, b) =>
+        // Established (hits > 1) first, then by confidence EMA descending.
+        (b.hits > 1 ? 1 : 0) - (a.hits > 1 ? 1 : 0) ||
+        b.confidenceEma - a.confidenceEma
+    );
+    for (const track of ranked.slice(this.maxTracks)) {
+      this.tracks.delete(track.trackId);
+    }
   }
 
   private applyMatch(track: Track, detection: TrackerInput, timestampMs: number): void {
